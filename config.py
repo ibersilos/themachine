@@ -50,3 +50,29 @@ SERENITY_RECENCY_DAYS: int  = _int("SERENITY_RECENCY_DAYS", 30)
 
 # yfinance
 FUNDAMENTALS_CACHE_TTL: int = _int("FUNDAMENTALS_CACHE_TTL", 3600)
+
+# ── Hogue Framework ───────────────────────────────────────────────────────────
+# Chiusura anticipata: chiudi se catturato >= questa percentuale del premio
+HOGUE_EARLY_CLOSE_PCT: float  = _float("HOGUE_EARLY_CLOSE_PCT", 0.50)
+# Regola 21-DTE: chiudi sempre se catturato >= 50% E DTE <= questo valore
+HOGUE_DTE_THRESHOLD: int      = _int("HOGUE_DTE_THRESHOLD", 21)
+# Roll: massimo roll consentiti per posizione prima di lasciare assegnare
+HOGUE_MAX_ROLLS: int          = _int("HOGUE_MAX_ROLLS", 2)
+# Roll: valuta roll se stock_price > strike * questa soglia
+HOGUE_ROLL_TRIGGER_PCT: float = _float("HOGUE_ROLL_TRIGGER_PCT", 0.97)
+# IV Rank minimo per vendere calls (sotto → skip ciclo)
+HOGUE_MIN_IV_RANK: float      = _float("HOGUE_MIN_IV_RANK", 20.0)
+# IV Rank alto → regime aggressivo (Iron Condor eligibile)
+HOGUE_HIGH_IV_RANK: float     = _float("HOGUE_HIGH_IV_RANK", 80.0)
+# Calo massimo settimanale prima di bloccare vendita calls
+HOGUE_WEEKLY_DROP_BLOCK: float = _float("HOGUE_WEEKLY_DROP_BLOCK", 0.10)
+# Giorni da earnings per bloccare automaticamente vendita calls
+HOGUE_EARNINGS_BUFFER_DAYS: int = _int("HOGUE_EARNINGS_BUFFER_DAYS", 7)
+# Profitto su stock per triggera Collar automatico
+HOGUE_COLLAR_TRIGGER_PCT: float = _float("HOGUE_COLLAR_TRIGGER_PCT", 0.20)
+# Collar: costo netto sotto cui segnalare come "protezione quasi gratuita"
+HOGUE_FREE_COLLAR_THRESHOLD: float = _float("HOGUE_FREE_COLLAR_THRESHOLD", 0.05)
+# Target cicli/anno (usato per annualizzazione)
+HOGUE_TARGET_CYCLES_YEAR: int = _int("HOGUE_TARGET_CYCLES_YEAR", 16)
+# DTE target per selezione opzioni (cerca expiry vicina a questo valore)
+HOGUE_TARGET_DTE: int         = _int("HOGUE_TARGET_DTE", 35)
