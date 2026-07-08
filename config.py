@@ -51,6 +51,26 @@ SERENITY_RECENCY_DAYS: int  = _int("SERENITY_RECENCY_DAYS", 30)
 # yfinance
 FUNDAMENTALS_CACHE_TTL: int = _int("FUNDAMENTALS_CACHE_TTL", 3600)
 
+# ── Interactive Brokers (ib_insync) ──────────────────────────────────────────
+# Host IB Gateway / TWS (di solito localhost)
+IBKR_HOST: str             = os.getenv("IBKR_HOST", "127.0.0.1")
+# Porta: TWS live=7496, TWS paper=7497, Gateway live=4001, Gateway paper=4002
+IBKR_PORT: int             = _int("IBKR_PORT", 7497)
+# clientId univoco per questa app (non condividere con altre sessioni API)
+IBKR_CLIENT_ID: int        = _int("IBKR_CLIENT_ID", 10)
+# Account IBKR specifico (vuoto = account principale); es: "U1234567"
+IBKR_ACCOUNT: str          = os.getenv("IBKR_ACCOUNT", "")
+# Timeout connessione in secondi
+IBKR_CONNECT_TIMEOUT: int  = _int("IBKR_CONNECT_TIMEOUT", 20)
+# Delay iniziale retry su disconnessione (raddoppia a ogni tentativo, cap 300s)
+IBKR_RECONNECT_DELAY: int  = _int("IBKR_RECONNECT_DELAY", 30)
+# Numero massimo tentativi di riconnessione prima di loggare CRITICAL
+IBKR_MAX_RETRIES: int      = _int("IBKR_MAX_RETRIES", 10)
+# Intervallo tra sync di posizioni nel loop daemon (secondi)
+IBKR_SYNC_INTERVAL: int    = _int("IBKR_SYNC_INTERVAL", 60)
+# Se True: stop loss vengono loggati ma NON inviati a IBKR (test sicuro)
+IBKR_DRY_RUN: bool         = os.getenv("IBKR_DRY_RUN", "true").lower() in ("1", "true", "yes")
+
 # ── Hogue Framework ───────────────────────────────────────────────────────────
 # Chiusura anticipata: chiudi se catturato >= questa percentuale del premio
 HOGUE_EARLY_CLOSE_PCT: float  = _float("HOGUE_EARLY_CLOSE_PCT", 0.50)
