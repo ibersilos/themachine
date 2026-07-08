@@ -1,55 +1,54 @@
 @echo off
-title THE MACHINE — Setup
+title THE MACHINE - Setup
 color 0A
 echo.
 echo  ============================================
-echo   THE MACHINE — Installazione iniziale
+echo   THE MACHINE - Installazione iniziale
 echo  ============================================
 echo.
 
-:: Verifica Python
 python --version >nul 2>&1
 if errorlevel 1 (
     color 0C
     echo  [ERRORE] Python non trovato.
     echo.
     echo  Scarica Python da: https://www.python.org/downloads/
-    echo  Assicurati di spuntare "Add Python to PATH" durante l'installazione.
+    echo  Spunta "Add Python to PATH" durante l'installazione.
     echo.
     pause
     exit /b 1
 )
-
 echo  [OK] Python trovato.
 echo.
-echo  Installazione dipendenze in corso...
-echo  (questa operazione richiede circa 1-2 minuti)
+
+echo  Installazione dipendenze in corso (1-2 minuti)...
 echo.
-pip install -r requirements.txt --quiet
+pip install -r requirements.txt
 if errorlevel 1 (
     color 0C
-    echo  [ERRORE] Installazione dipendenze fallita.
+    echo.
+    echo  [ERRORE] Installazione fallita.
     pause
     exit /b 1
 )
+echo.
 echo  [OK] Dipendenze installate.
 echo.
 
-:: Crea .env da .env.example se non esiste
 if not exist ".env" (
     copy ".env.example" ".env" >nul
-    echo  [OK] File .env creato da .env.example
-    echo.
     color 0E
+    echo  [OK] File .env creato.
+    echo.
     echo  ============================================
-    echo   ATTENZIONE: configura il file .env
+    echo   CONFIGURA IL FILE .env CHE SI APRE ORA
     echo  ============================================
     echo.
-    echo  Apri il file .env con Notepad e compila:
-    echo    - TELEGRAM_BOT_TOKEN   (da @BotFather su Telegram)
-    echo    - TELEGRAM_CHAT_ID     (il tuo Chat ID)
+    echo  Compila queste due righe:
+    echo    TELEGRAM_BOT_TOKEN=...  (da @BotFather)
+    echo    TELEGRAM_CHAT_ID=...    (il tuo chat ID)
     echo.
-    echo  Poi riesegui avvia.bat
+    echo  Salva e chiudi Notepad, poi usa avvia.bat
     echo.
     notepad .env
 ) else (
@@ -59,7 +58,7 @@ if not exist ".env" (
 echo.
 color 0A
 echo  ============================================
-echo   Setup completato! Usa avvia.bat per partire.
+echo   Setup completato! Doppio click su avvia.bat
 echo  ============================================
 echo.
 pause
