@@ -51,6 +51,10 @@ SERENITY_RECENCY_DAYS: int  = _int("SERENITY_RECENCY_DAYS", 30)
 # yfinance
 FUNDAMENTALS_CACHE_TTL: int = _int("FUNDAMENTALS_CACHE_TTL", 3600)
 
+# ── API Server (FastAPI/uvicorn) ──────────────────────────────────────────────
+API_HOST: str = os.getenv("API_HOST", "127.0.0.1")
+API_PORT: int = _int("API_PORT", 8080)
+
 # ── Interactive Brokers (ib_insync) ──────────────────────────────────────────
 # Host IB Gateway / TWS (di solito localhost)
 IBKR_HOST: str             = os.getenv("IBKR_HOST", "127.0.0.1")

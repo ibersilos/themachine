@@ -23,6 +23,7 @@ import fundamentals
 import scoring_engine
 import telegram_bot
 import drive_export
+import api_server
 
 logging.basicConfig(
     level=logging.INFO,
@@ -105,6 +106,7 @@ def _scoring_worker() -> None:
             enriched["flags"] = bd.flags
 
             telegram_bot.dispatch_signal(bd, enriched)
+            api_server.notify_signal()
 
             if bd.total >= 40:  # accumulate anything notable for daily export
                 _daily_signals.append(enriched)
@@ -132,6 +134,11 @@ def main() -> None:
 
     db.init_db()
     logger.info("DB ready at %s", db.config.DB_PATH)
+
+    api_server.start_api_thread(
+        host=config.API_HOST,
+        port=config.API_PORT,
+    )
 
     telegram_bot.run_bot_in_thread()
     telegram_bot.send_alert(
