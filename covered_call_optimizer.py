@@ -269,6 +269,80 @@ def _find_strike_by_delta(
     return float(best["strike"]), _mid_price(best)
 
 
+def _fetch_live_premium(
+    ticker_obj: yf.Ticker,
+    strike: float,
+    expiry_str: str,
+    option_type: str = "call",
+) -> float | None:
+    """
+    Legge il mid price live dalla catena opzioni per uno strike e una scadenza esatti.
+
+    Args:
+        ticker_obj:  istanza yf.Ticker già creata
+        strike:      strike della call/put aperta
+        expiry_str:  scadenza in formato YYYY-MM-DD (es. '2025-08-15')
+        option_type: 'call' (default) o 'put'
+
+    Returns:
+        mid price float, oppure None se non trovato o in caso di errore di rete.
+
+    Note:
+        yfinance richiede la scadenza esatta nella lista ticker_obj.options;
+        se expiry_str non corrisponde a una scadenza disponibile la chiamata
+        a option_chain() lancia KeyError — gestito con fallback a None.
+    """
+    try:
+        available = _retry_yf(lambda: ticker_obj.options)
+        if expiry_str not in available:
+            # Trova la scadenza disponibile più vicina per data
+            target = date.fromisoformat(expiry_str)
+            closest = min(
+                available,
+                key=lambda e: abs((date.fromisoformat(e) - target).days),
+                default=None,
+            )
+            if closest is None:
+                logger.warning("_fetch_live_premium: nessuna scadenza disponibile per %s", ticker_obj.ticker)
+                return None
+            logger.debug(
+                "_fetch_live_premium: scadenza %s non trovata, uso più vicina %s",
+                expiry_str, closest,
+            )
+            expiry_str = closest
+
+        chain = _retry_yf(lambda: ticker_obj.option_chain(expiry_str))
+        df = chain.calls if option_type == "call" else chain.puts
+        if df.empty:
+            return None
+
+        df = df.copy()
+        df["_diff"] = (df["strike"] - strike).abs()
+        best = df.loc[df["_diff"].idxmin()]
+
+        # Tolleranza 0.50: avvisa se lo strike trovato differisce sensibilmente
+        if float(best["_diff"]) > 0.50:
+            logger.warning(
+                "_fetch_live_premium %s: strike richiesto %.2f, trovato %.2f (diff %.2f) — "
+                "possibile mismatch. Verifica che lo strike sia multiplo standard.",
+                ticker_obj.ticker, strike, float(best["strike"]), float(best["_diff"]),
+            )
+
+        mid = _mid_price(best)
+        if mid <= 0:
+            # last resort: usa lastPrice
+            mid = float(best.get("lastPrice", 0) or 0)
+
+        return round(mid, 2) if mid > 0 else None
+
+    except Exception as exc:
+        logger.warning(
+            "_fetch_live_premium(%s, strike=%.2f, expiry=%s): %s",
+            getattr(ticker_obj, "ticker", "?"), strike, expiry_str, exc,
+        )
+        return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  HogueOptimizer — classe principale
 # ─────────────────────────────────────────────────────────────────────────────
@@ -946,58 +1020,137 @@ class HogueOptimizer:
 def run_hogue_check(ticker: str, cycle_id: int | None = None) -> None:
     """
     Entry point per il loop principale di the-machine.
-    Esegue tutti i check Hogue per un ticker e invia gli alert Telegram necessari.
+
+    Flusso:
+      0. Carica il ciclo aperto dal DB
+      1. Aggiorna premium_current da yfinance in real-time (mid price live)
+      2. Aggiorna il valore nel DB
+      3. Esegue check_early_close  → alert Telegram se azione richiesta
+      4. Esegue check_roll_opportunity → alert Telegram se roll/assegnazione
+      5. Esegue calculate_collar  → alert Telegram se profitto >20%
+      6. Nessuna azione: log di stato, nessun alert
     """
     from telegram_bot import send_alert
 
-    opt = HogueOptimizer()
-    ticker_obj  = _get_ticker(ticker)
-    stock_price = _current_price(ticker_obj)
+    opt        = HogueOptimizer()
+    conn       = db._conn()
+    ticker_obj = _get_ticker(ticker)
 
-    # Recupera ciclo aperto dal DB
+    # ── Step 0a: recupera ciclo aperto dal DB ────────────────────────────────
     if cycle_id is None:
-        conn = db._conn()
-        row = conn.execute(
-            "SELECT * FROM wheel_cycles WHERE ticker=? AND phase != 'closed' ORDER BY opened_at DESC LIMIT 1",
+        row_cycle = conn.execute(
+            "SELECT * FROM wheel_cycles "
+            "WHERE ticker=? AND phase != 'closed' "
+            "ORDER BY opened_at DESC LIMIT 1",
             (ticker,),
         ).fetchone()
-        if not row:
-            logger.info("Nessun ciclo aperto per %s", ticker)
+        if not row_cycle:
+            logger.info("run_hogue_check: nessun ciclo aperto per %s", ticker)
             return
-        cycle_id = row["id"]
+        cycle_id = row_cycle["id"]
+    else:
+        row_cycle = conn.execute(
+            "SELECT * FROM wheel_cycles WHERE id=?", (cycle_id,)
+        ).fetchone()
+        if not row_cycle:
+            logger.error("run_hogue_check: cycle_id %d non trovato nel DB", cycle_id)
+            return
 
-    conn = db._conn()
-    row = conn.execute("SELECT * FROM wheel_cycles WHERE id=?", (cycle_id,)).fetchone()
-    if not row:
-        return
+    # ── Step 0b: leggi entry_price dalla tabella positions (se disponibile) ──
+    # La tabella `positions` registra il prezzo di carico reale delle azioni.
+    # Se non presente (es. posizione non ancora registrata), usa lo strike come
+    # proxy conservativo (worst case: entry al prezzo strike).
+    pos_row = conn.execute(
+        "SELECT entry_price FROM positions WHERE ticker=?", (ticker,)
+    ).fetchone()
+    entry_price: float = (
+        float(pos_row["entry_price"])
+        if pos_row and pos_row["entry_price"]
+        else float(row_cycle["strike"])
+    )
+    if not pos_row:
+        logger.debug(
+            "run_hogue_check: %s non in tabella positions, uso strike %.2f come entry_price",
+            ticker, entry_price,
+        )
 
+    # ── Step 0c: costruisci WheelPosition con dati DB ────────────────────────
     position = WheelPosition(
         cycle_id         = cycle_id,
         ticker           = ticker,
-        strike           = row["strike"],
-        expiry           = date.fromisoformat(row["expiry"]),
-        premium_received = row["premium_received"],
-        premium_current  = row["premium_current"],
-        entry_price      = row["strike"],  # approssimazione; aggiorna se disponibile
-        roll_count       = row["roll_count"],
-        phase            = row["phase"],
+        strike           = float(row_cycle["strike"]),
+        expiry           = date.fromisoformat(row_cycle["expiry"]),
+        premium_received = float(row_cycle["premium_received"]),
+        premium_current  = float(row_cycle["premium_current"]),  # valore DB; aggiornato al passo 1
+        entry_price      = entry_price,
+        roll_count       = int(row_cycle["roll_count"]),
+        phase            = row_cycle["phase"],
     )
 
-    # 1. Check chiusura anticipata
+    # ── Step 1: aggiorna premium_current da yfinance in real-time ────────────
+    # Legge la catena opzioni per il ticker, trova la call con strike e
+    # scadenza corrispondenti, calcola il mid price (bid+ask)/2.
+    expiry_str   = row_cycle["expiry"]   # formato YYYY-MM-DD
+    live_premium = _fetch_live_premium(ticker_obj, position.strike, expiry_str, "call")
+
+    if live_premium is not None:
+        logger.info(
+            "run_hogue_check %s: premium live $%.2f (DB aveva $%.2f)",
+            ticker, live_premium, position.premium_current,
+        )
+        # ── Step 2: aggiorna il DB con il nuovo valore ──────────────────────
+        position.premium_current = live_premium
+        db.update_wheel_premium(cycle_id, live_premium)
+    else:
+        logger.warning(
+            "run_hogue_check %s: impossibile aggiornare premium live — "
+            "uso valore DB $%.2f (mercato chiuso o opzione scaduta?)",
+            ticker, position.premium_current,
+        )
+
+    # Prezzo corrente dello stock (usato dal collar check)
+    stock_price = _current_price(ticker_obj)
+
+    # ── Step 3: check chiusura anticipata ────────────────────────────────────
     close_action = opt.check_early_close(position)
     if close_action.action == "close":
-        send_alert(close_action.telegram_msg)
+        # Costruisci anche il messaggio Wheel Update completo
+        # (include prossimo ciclo se IV lo permette)
+        next_cycle_data: dict | None = None
+        can_sell, _ = opt.should_sell_call(ticker)
+        if can_sell:
+            next_cycle_data = opt.select_strike(ticker)
+
+        full_msg = opt.format_wheel_alert(position, close_action, next_cycle_data)
+        send_alert(full_msg)
+        logger.info("run_hogue_check %s: alert CHIUDI inviato (%.0f%% catturato, %d DTE)",
+                    ticker, position.pct_captured * 100, position.days_to_expiry)
         return
 
-    # 2. Check roll
+    # ── Step 4: check roll ────────────────────────────────────────────────────
     roll_action = opt.check_roll_opportunity(position)
     if roll_action.action in ("roll", "assigned"):
-        send_alert(roll_action.telegram_msg)
+        full_msg = opt.format_wheel_alert(position, roll_action)
+        send_alert(full_msg)
         if roll_action.action == "roll":
-            db.increment_roll_count(cycle_id)
+            new_count = db.increment_roll_count(cycle_id)
+            logger.info("run_hogue_check %s: alert ROLL inviato (roll #%d)", ticker, new_count)
+        else:
+            logger.info("run_hogue_check %s: alert ASSEGNAZIONE inviato", ticker)
         return
 
-    # 3. Check collar (se posizione stock in profitto >20%)
+    # ── Step 5: check collar ──────────────────────────────────────────────────
     collar = opt.calculate_collar(position, stock_price)
     if collar:
         send_alert(collar["telegram_msg"])
+        logger.info(
+            "run_hogue_check %s: alert COLLAR inviato (profitto +%.1f%%)",
+            ticker, collar["profit_pct"],
+        )
+        return
+
+    # ── Step 6: nessuna azione richiesta ─────────────────────────────────────
+    logger.info(
+        "run_hogue_check %s: nessuna azione — %.0f%% catturato, %d DTE, stock $%.2f",
+        ticker, position.pct_captured * 100, position.days_to_expiry, stock_price,
+    )
