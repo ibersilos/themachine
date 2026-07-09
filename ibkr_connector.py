@@ -18,12 +18,19 @@ Prerequisito: IB Gateway o TWS aperto e configurato per API locale.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import threading
 import time
 from dataclasses import dataclass
 from datetime import date
 from typing import Callable, Optional
+
+# ib_insync/eventkit chiama get_event_loop() all'import — richiede loop esplicito in Python 3.12+
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
 from ib_insync import IB, Stock, StopOrder, util
 

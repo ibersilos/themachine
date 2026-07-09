@@ -60,6 +60,14 @@ def init_db() -> None:
             shares       REAL DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS risk_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            event       TEXT NOT NULL,   -- stop_loss | drawdown_pause | kill_switch
+            ticker      TEXT,
+            detail      TEXT,            -- JSON
+            created_at  TEXT DEFAULT (datetime('now'))
+        );
+
         CREATE INDEX IF NOT EXISTS idx_signals_ticker ON signals(ticker);
         CREATE INDEX IF NOT EXISTS idx_signals_source ON signals(source);
 

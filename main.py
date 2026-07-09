@@ -14,6 +14,7 @@ import threading
 import time
 from datetime import datetime, timezone
 
+import config
 import database as db
 import edgar_monitor
 import usaspending
@@ -24,6 +25,7 @@ import scoring_engine
 import telegram_bot
 import drive_export
 import api_server
+import ibkr_connector
 
 logging.basicConfig(
     level=logging.INFO,
@@ -148,6 +150,14 @@ def main() -> None:
 
     threading.Thread(target=_scoring_worker, name="scorer", daemon=True).start()
     threading.Thread(target=_stop_loss_watcher, name="stop-loss", daemon=True).start()
+
+    # IBKR connector — opzionale, non blocca se TWS/Gateway è offline
+    def _on_ibkr_sync(result: ibkr_connector.SyncResult) -> None:
+        api_server.set_ibkr_status(connected=True, positions=result.synced)
+        if result.errors:
+            logger.warning("IBKR sync errors: %s", result.errors)
+
+    ibkr_connector.start_ibkr_thread(_on_ibkr_sync)
 
     # USAspending in its own thread (slower poll)
     threading.Thread(

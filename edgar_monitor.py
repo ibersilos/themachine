@@ -54,19 +54,36 @@ def _get(url: str, timeout: int = 15) -> requests.Response:
     return resp
 
 
+_TICKER_CACHE: dict[str, str | None] = {}
+
+_SUBMISSIONS_BASE = "https://data.sec.gov/submissions"
+
+
 def _parse_ticker_from_filing(filing_url: str) -> str | None:
-    """Best-effort ticker extraction from an individual filing index page."""
+    """Extract ticker via EDGAR submissions API (data.sec.gov) using CIK from URL."""
+    if not filing_url:
+        return None
+
+    cik_match = re.search(r"/data/(\d+)/", filing_url)
+    if not cik_match:
+        return None
+    cik_raw = cik_match.group(1)
+
+    if cik_raw in _TICKER_CACHE:
+        return _TICKER_CACHE[cik_raw]
+
+    ticker = None
     try:
-        soup = BeautifulSoup(_get(filing_url).text, "html.parser")
-        # The filer info table usually has the CIK and company name
-        for td in soup.find_all("td"):
-            text = td.get_text(" ", strip=True)
-            m = re.search(r"Ticker Symbol:\s*([A-Z]{1,5})", text, re.I)
-            if m:
-                return m.group(1).upper()
+        url = f"{_SUBMISSIONS_BASE}/CIK{cik_raw.zfill(10)}.json"
+        data = _get(url).json()
+        tickers = data.get("tickers", [])
+        if tickers:
+            ticker = tickers[0].upper()
     except Exception:
         pass
-    return None
+
+    _TICKER_CACHE[cik_raw] = ticker
+    return ticker
 
 
 def _extract_8k_items(filing_index_url: str) -> list[str]:
@@ -165,6 +182,16 @@ def poll_form4() -> Generator[dict, None, None]:
     entries = _parse_rss_entries(xml)
     for entry in entries:
         _SEEN_IDS.add(entry["id"])
+
+        # Skip non-Form-4 filings that EDGAR returns (e.g. 424B2, SC 13G, etc.)
+        title = entry.get("title", "")
+        if not re.match(r"^4[\s/]", title) and not title.startswith("4 -"):
+            # Accept only filings whose type is "4" or "4/A"
+            # Title format: "4 - PERSON NAME ..."  or "4/A - ..."
+            if not re.search(r"^\b4(/A)?\b", title):
+                logger.debug("Form-4 poll: skipping non-Form-4 entry: %s", title[:80])
+                continue
+
         ticker = _parse_ticker_from_filing(entry["url"]) if entry["url"] else None
 
         signal = {
@@ -174,8 +201,6 @@ def poll_form4() -> Generator[dict, None, None]:
             "filing_url":   entry["url"],
             "cik":          entry["cik"],
             "timestamp":    entry["updated"],
-            # Form-4 detail parsing is handled by form4_monitor.py
-            # Here we just flag the raw event
             "_raw_title":   entry["title"],
         }
 

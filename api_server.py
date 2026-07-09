@@ -52,12 +52,26 @@ app.add_middleware(
 _last_signal_ts: float = time.time()
 _signal_count_today: int = 0
 
+# Stato IBKR (aggiornato da ibkr_connector via set_ibkr_status)
+_ibkr_connected: bool = False
+_ibkr_positions: list = []
+_ibkr_last_sync: float = 0.0
+
 
 def notify_signal() -> None:
     """Chiamata da main.py ogni volta che arriva un segnale."""
     global _last_signal_ts, _signal_count_today
     _last_signal_ts = time.time()
     _signal_count_today += 1
+
+
+def set_ibkr_status(connected: bool, positions: list | None = None) -> None:
+    """Aggiornata da ibkr_connector a ogni sync."""
+    global _ibkr_connected, _ibkr_positions, _ibkr_last_sync
+    _ibkr_connected = connected
+    if positions is not None:
+        _ibkr_positions = positions
+    _ibkr_last_sync = time.time()
 
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
@@ -100,6 +114,8 @@ def get_status() -> dict:
             "signals_today": _signal_count_today,
             "stop_loss_pct": config.STOP_LOSS_PCT,
             "max_monthly_drawdown": config.MAX_MONTHLY_DRAWDOWN,
+            "ibkr_connected": _ibkr_connected,
+            "ibkr_last_sync": _ibkr_last_sync or None,
         }
     except Exception as exc:
         logger.error("/api/status error: %s", exc)
@@ -331,6 +347,26 @@ def get_wheel(year: int | None = Query(default=None)) -> dict:
 @app.get("/api/health")
 def health() -> dict:
     return {"ok": True, "ts": time.time()}
+
+
+# ── /api/ibkr ─────────────────────────────────────────────────────────────────
+
+@app.get("/api/ibkr")
+def get_ibkr() -> dict:
+    """Stato connessione IBKR e posizioni sincronizzate."""
+    age = None
+    if _ibkr_last_sync:
+        secs = int(time.time() - _ibkr_last_sync)
+        age = f"{secs}s fa" if secs < 60 else f"{secs//60}m fa"
+    return {
+        "ok": True,
+        "connected": _ibkr_connected,
+        "last_sync_ago": age,
+        "position_count": len(_ibkr_positions),
+        "dry_run": config.IBKR_DRY_RUN,
+        "host": config.IBKR_HOST,
+        "port": config.IBKR_PORT,
+    }
 
 
 # ── SERVER START ──────────────────────────────────────────────────────────────

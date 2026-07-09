@@ -41,8 +41,8 @@ MAX_MONTHLY_DRAWDOWN: float = _float("MAX_MONTHLY_DRAWDOWN", 0.20)
 DRAWDOWN_PAUSE_DAYS: int    = _int("DRAWDOWN_PAUSE_DAYS", 30)
 
 # Scoring
-MIN_ALERT_SCORE: int      = _int("MIN_ALERT_SCORE", 60)
-STRONG_BUY_THRESHOLD: int = _int("STRONG_BUY_THRESHOLD", 80)
+MIN_ALERT_SCORE: int      = _int("MIN_ALERT_SCORE", 20)
+STRONG_BUY_THRESHOLD: int = _int("STRONG_BUY_THRESHOLD", 50)
 
 # Serenity
 SERENITY_ARCHIVE_PATH: Path = Path(os.getenv("SERENITY_ARCHIVE_PATH", "data/serenity_tweets.json"))
