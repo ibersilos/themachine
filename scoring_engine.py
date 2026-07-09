@@ -27,6 +27,7 @@ class ScoreBreakdown:
     total: int = 0
     components: dict[str, int] = field(default_factory=dict)
     flags: list[str] = field(default_factory=list)
+    filtered: bool = False        # True → segnale scartato per market cap
 
     def tier(self) -> str:
         if self.total >= config.STRONG_BUY_THRESHOLD:
@@ -207,10 +208,36 @@ def score_signal(signal: dict) -> ScoreBreakdown:
     The signal must have a 'source' key matching one of the scorers.
     Supplementary data (fundamentals, serenity) is attached in-place
     by their respective monitors before calling this function.
+
+    Se market cap è fuori range [MARKET_CAP_MIN, MARKET_CAP_MAX],
+    ritorna ScoreBreakdown con filtered=True — il chiamante deve scartare.
     """
     source = signal.get("source", "unknown")
     ticker = signal.get("ticker")
     bd = ScoreBreakdown(ticker=ticker)
+
+    # ── Filtro market cap ─────────────────────────────────────────────────────
+    market_cap = signal.get("market_cap")
+    if market_cap is not None:
+        cap_b = market_cap / 1_000_000_000  # in miliardi per il log
+        if market_cap > config.MARKET_CAP_MAX:
+            logger.info(
+                "%s scartata: market cap $%.0fB > soglia $%.0fM",
+                ticker or "—",
+                cap_b,
+                config.MARKET_CAP_MAX / 1_000_000,
+            )
+            bd.filtered = True
+            return bd
+        if market_cap < config.MARKET_CAP_MIN:
+            logger.info(
+                "%s scartata: market cap $%.0fM < minimo $%.0fM (micro cap)",
+                ticker or "—",
+                market_cap / 1_000_000,
+                config.MARKET_CAP_MIN / 1_000_000,
+            )
+            bd.filtered = True
+            return bd
 
     # Primary source score
     scorer = _SCORERS.get(source)

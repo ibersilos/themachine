@@ -103,6 +103,8 @@ def _scoring_worker() -> None:
                 continue
 
             bd = scoring_engine.score_signal(enriched)
+            if bd.filtered:
+                continue  # market cap fuori range — nessun alert
             enriched["score"] = bd.total
             enriched["tier"]  = bd.tier()
             enriched["flags"] = bd.flags

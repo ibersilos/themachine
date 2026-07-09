@@ -40,6 +40,10 @@ DRAWDOWN_PAUSE_DAYS: int    = _int("DRAWDOWN_PAUSE_DAYS", 30)
 MIN_ALERT_SCORE: int      = _int("MIN_ALERT_SCORE", 20)
 STRONG_BUY_THRESHOLD: int = _int("STRONG_BUY_THRESHOLD", 50)
 
+# Filtro market cap (solo small/mid cap interessanti per wheel strategy)
+MARKET_CAP_MIN: int = _int("MARKET_CAP_MIN",  50_000_000)   # $50M  — evita micro cap illiquide
+MARKET_CAP_MAX: int = _int("MARKET_CAP_MAX", 500_000_000)   # $500M — scarta large cap
+
 # Serenity
 SERENITY_ARCHIVE_PATH: Path = Path(os.getenv("SERENITY_ARCHIVE_PATH", "data/serenity_tweets.json"))
 SERENITY_RECENCY_DAYS: int  = _int("SERENITY_RECENCY_DAYS", 30)
