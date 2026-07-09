@@ -28,10 +28,6 @@ EDGAR_POLL_INTERVAL: int    = _int("EDGAR_POLL_INTERVAL", 60)
 # USAspending
 USASPENDING_POLL_INTERVAL: int = _int("USASPENDING_POLL_INTERVAL", 300)
 
-# Google Drive
-GOOGLE_SERVICE_ACCOUNT_JSON: Path = Path(os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "credentials/service_account.json"))
-GOOGLE_DRIVE_FOLDER_ID: str       = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "")
-
 # Database
 DB_PATH: Path = Path(os.getenv("DB_PATH", "data/the_machine.db"))
 

@@ -1,185 +1,146 @@
 """
-Google Drive export – writes daily signal reports as Google Sheets / CSV.
+drive_export.py — Export locale su file system (no dipendenze Google Cloud).
 
-Uses a service account (no OAuth browser flow needed).
-Falls back gracefully if credentials are missing.
+Struttura cartelle:
+  exports/
+    logs/    → segnali giornalieri  (the-machine-signals-YYYY-MM-DD.csv)
+    reports/ → report wheel mensili (wheel-report-YYYY-MM.csv)
+    tax/     → riepilogo PnL anno   (pnl-YYYY.csv)
+
+Funzioni pubbliche:
+  export_daily_signals(signals)       → salva in exports/logs/
+  export_wheel_report(cycles)         → salva in exports/reports/
+  export_tax_summary(cycles, year)    → salva in exports/tax/
 """
+from __future__ import annotations
+
 import csv
-import io
-import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
 
-import config
-
 logger = logging.getLogger(__name__)
 
-_drive_service = None
-_sheets_service = None
+EXPORTS_DIR = Path("exports")
+LOGS_DIR    = EXPORTS_DIR / "logs"
+REPORTS_DIR = EXPORTS_DIR / "reports"
+TAX_DIR     = EXPORTS_DIR / "tax"
 
 
-def _build_services():
-    global _drive_service, _sheets_service
-    if _drive_service is not None:
-        return True
-
-    creds_path: Path = config.GOOGLE_SERVICE_ACCOUNT_JSON
-    if not creds_path.exists():
-        logger.warning(
-            "Google service account JSON not found at %s – Drive export disabled",
-            creds_path,
-        )
-        return False
-
-    try:
-        from google.oauth2 import service_account
-        from googleapiclient.discovery import build
-
-        scopes = [
-            "https://www.googleapis.com/auth/drive.file",
-            "https://www.googleapis.com/auth/spreadsheets",
-        ]
-        creds = service_account.Credentials.from_service_account_file(
-            str(creds_path), scopes=scopes
-        )
-        _drive_service  = build("drive",  "v3", credentials=creds, cache_discovery=False)
-        _sheets_service = build("sheets", "v4", credentials=creds, cache_discovery=False)
-        return True
-    except Exception as exc:
-        logger.error("Failed to build Google API clients: %s", exc)
-        return False
+def _ensure_dirs() -> None:
+    for d in (LOGS_DIR, REPORTS_DIR, TAX_DIR):
+        d.mkdir(parents=True, exist_ok=True)
 
 
-def _upload_csv(name: str, csv_bytes: bytes) -> str | None:
-    """Upload CSV to Drive folder, return file ID."""
-    from googleapiclient.http import MediaInMemoryUpload
+def _write_csv(path: Path, fieldnames: list[str], rows: list[dict]) -> Path:
+    with path.open("w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    logger.info("Salvato: %s (%d righe)", path, len(rows))
+    return path
 
-    media = MediaInMemoryUpload(csv_bytes, mimetype="text/csv", resumable=False)
-    meta  = {
-        "name":    name,
-        "parents": [config.GOOGLE_DRIVE_FOLDER_ID] if config.GOOGLE_DRIVE_FOLDER_ID else [],
-    }
-    try:
-        f = _drive_service.files().create(
-            body=meta, media_body=media, fields="id"
-        ).execute()
-        return f.get("id")
-    except Exception as exc:
-        logger.error("Drive upload failed: %s", exc)
-        return None
 
+# ── SEGNALI GIORNALIERI ───────────────────────────────────────────────────────
 
 def export_daily_signals(signals: list[dict]) -> str | None:
     """
-    Exports today's scored signals as a CSV to Google Drive.
-    Returns the Drive file URL or None on failure.
+    Salva i segnali del giorno in exports/logs/the-machine-signals-YYYY-MM-DD.csv.
+    Chiamata da main.py a fine giornata UTC.
+    Restituisce il path assoluto del file o None se non ci sono segnali.
     """
-    if not _build_services():
-        return None
     if not signals:
-        logger.info("No signals to export today")
+        logger.info("Nessun segnale da esportare oggi")
         return None
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    filename = f"the-machine-signals-{today}.csv"
+    _ensure_dirs()
+    today    = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    out_path = LOGS_DIR / f"the-machine-signals-{today}.csv"
 
-    # Build CSV in memory
-    buf = io.StringIO()
     fieldnames = [
         "timestamp", "source", "ticker", "score", "tier",
-        "flags", "filing_url", "award_amount", "insider_name",
-        "transaction_value_usd", "serenity_confidence", "pe_ratio",
+        "flags", "filing_url", "award_amount",
+        "insider_name", "transaction_value_usd",
+        "serenity_confidence", "pe_ratio",
     ]
-    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
-    writer.writeheader()
 
+    rows = []
     for sig in signals:
         row = {k: sig.get(k, "") for k in fieldnames}
-        # Flatten list fields
         if isinstance(row.get("flags"), list):
             row["flags"] = "; ".join(row["flags"])
-        writer.writerow(row)
+        rows.append(row)
 
-    csv_bytes = buf.getvalue().encode("utf-8-sig")  # BOM for Excel compat
-    file_id = _upload_csv(filename, csv_bytes)
-
-    if file_id:
-        url = f"https://drive.google.com/file/d/{file_id}/view"
-        logger.info("Signals exported to Drive: %s", url)
-        return url
-    return None
+    _write_csv(out_path, fieldnames, rows)
+    return str(out_path.resolve())
 
 
-def export_signals_to_sheet(signals: list[dict], spreadsheet_id: str | None = None) -> str | None:
+# ── REPORT WHEEL MENSILE ──────────────────────────────────────────────────────
+
+def export_wheel_report(cycles: list[dict], month: str | None = None) -> str | None:
     """
-    Append today's signals to a Google Sheet (creates new sheet if
-    spreadsheet_id is None). Returns the spreadsheet URL.
+    Salva il report cicli wheel in exports/reports/wheel-report-YYYY-MM.csv.
+    `cycles` è una lista di dict con campi dal DB wheel_cycles.
     """
-    if not _build_services():
-        return None
-    if not signals:
+    if not cycles:
         return None
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _ensure_dirs()
+    month    = month or datetime.now(timezone.utc).strftime("%Y-%m")
+    out_path = REPORTS_DIR / f"wheel-report-{month}.csv"
 
-    # Create spreadsheet if needed
-    if not spreadsheet_id:
-        try:
-            ss = _sheets_service.spreadsheets().create(body={
-                "properties": {"title": f"the-machine {today}"},
-                "sheets": [{"properties": {"title": "Signals"}}],
-            }).execute()
-            spreadsheet_id = ss["spreadsheetId"]
-            # Move to Drive folder
-            if config.GOOGLE_DRIVE_FOLDER_ID:
-                _drive_service.files().update(
-                    fileId=spreadsheet_id,
-                    addParents=config.GOOGLE_DRIVE_FOLDER_ID,
-                    fields="id, parents",
-                ).execute()
-        except Exception as exc:
-            logger.error("Sheet creation failed: %s", exc)
-            return None
-
-    headers = [
-        "Timestamp", "Source", "Ticker", "Score", "Tier",
-        "Flags", "Filing URL", "Award Amount",
-        "Insider Name", "Transaction Value USD",
-        "Serenity Confidence", "PE Ratio",
+    fieldnames = [
+        "id", "ticker", "year", "cycle_number", "phase",
+        "strike", "expiry", "premium_received", "premium_current",
+        "roll_count", "opened_at", "closed_at", "pnl_realized",
     ]
-    rows = [headers]
-    for sig in signals:
-        flags = sig.get("flags", [])
-        if isinstance(flags, list):
-            flags = "; ".join(flags)
-        rows.append([
-            sig.get("timestamp", ""),
-            sig.get("source", ""),
-            sig.get("ticker", ""),
-            sig.get("score", ""),
-            sig.get("tier", ""),
-            flags,
-            sig.get("filing_url") or sig.get("award_url", ""),
-            sig.get("award_amount", ""),
-            sig.get("insider_name", ""),
-            sig.get("transaction_value_usd", ""),
-            sig.get("serenity_confidence", ""),
-            sig.get("pe_ratio", ""),
-        ])
 
-    try:
-        _sheets_service.spreadsheets().values().append(
-            spreadsheetId=spreadsheet_id,
-            range="Signals!A1",
-            valueInputOption="USER_ENTERED",
-            insertDataOption="INSERT_ROWS",
-            body={"values": rows},
-        ).execute()
-    except Exception as exc:
-        logger.error("Sheet append failed: %s", exc)
+    _write_csv(out_path, fieldnames, [dict(c) for c in cycles])
+    return str(out_path.resolve())
+
+
+# ── RIEPILOGO TAX / PNL ANNUO ─────────────────────────────────────────────────
+
+def export_tax_summary(cycles: list[dict], year: int | None = None) -> str | None:
+    """
+    Salva il riepilogo PnL annuo in exports/tax/pnl-YYYY.csv.
+    Calcola per ogni ticker: premi totali ricevuti, PnL realizzato, n° cicli.
+    """
+    if not cycles:
         return None
 
-    url = f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}"
-    logger.info("Signals appended to Sheet: %s", url)
-    return url
+    _ensure_dirs()
+    year     = year or datetime.now(timezone.utc).year
+    out_path = TAX_DIR / f"pnl-{year}.csv"
+
+    # Aggrega per ticker
+    summary: dict[str, dict] = {}
+    for c in cycles:
+        ticker = c.get("ticker", "UNKNOWN")
+        if ticker not in summary:
+            summary[ticker] = {
+                "ticker":            ticker,
+                "year":              year,
+                "cycles_closed":     0,
+                "premium_total":     0.0,
+                "pnl_realized_total":0.0,
+                "avg_pnl_per_cycle": 0.0,
+            }
+        if c.get("phase") == "closed":
+            summary[ticker]["cycles_closed"]      += 1
+            summary[ticker]["premium_total"]       += float(c.get("premium_received") or 0)
+            summary[ticker]["pnl_realized_total"]  += float(c.get("pnl_realized") or 0)
+
+    rows = list(summary.values())
+    for r in rows:
+        n = r["cycles_closed"]
+        r["avg_pnl_per_cycle"] = round(r["pnl_realized_total"] / n, 2) if n else 0.0
+        r["premium_total"]     = round(r["premium_total"], 2)
+        r["pnl_realized_total"]= round(r["pnl_realized_total"], 2)
+
+    fieldnames = [
+        "ticker", "year", "cycles_closed",
+        "premium_total", "pnl_realized_total", "avg_pnl_per_cycle",
+    ]
+    _write_csv(out_path, fieldnames, rows)
+    return str(out_path.resolve())
