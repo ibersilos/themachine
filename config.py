@@ -40,9 +40,18 @@ DRAWDOWN_PAUSE_DAYS: int    = _int("DRAWDOWN_PAUSE_DAYS", 30)
 MIN_ALERT_SCORE: int      = _int("MIN_ALERT_SCORE", 20)
 STRONG_BUY_THRESHOLD: int = _int("STRONG_BUY_THRESHOLD", 50)
 
-# Filtro market cap (solo small/mid cap interessanti per wheel strategy)
-MARKET_CAP_MIN: int = _int("MARKET_CAP_MIN",  50_000_000)   # $50M  — evita micro cap illiquide
-MARKET_CAP_MAX: int = _int("MARKET_CAP_MAX", 500_000_000)   # $500M — scarta large cap
+# ── Dual pipeline filters ─────────────────────────────────────────────────────
+# STOCK_PICKING (fonti: form4 + usaspending)
+PICK_CAP_MIN:   int   = _int("PICK_CAP_MIN",    50_000_000)   # $50M  — evita micro cap
+PICK_CAP_MAX:   int   = _int("PICK_CAP_MAX",   500_000_000)   # $500M — small/mid cap
+PICK_VOL_MIN:   int   = _int("PICK_VOL_MIN",       200_000)   # volume medio giornaliero minimo
+PICK_PRICE_MIN: float = _float("PICK_PRICE_MIN",       2.0)   # prezzo minimo $
+PICK_PRICE_MAX: float = _float("PICK_PRICE_MAX",      25.0)   # prezzo massimo $
+
+# WHEEL_CANDIDATES (fonti: edgar_8k + serenity)
+WHEEL_CAP_MIN:      int   = _int("WHEEL_CAP_MIN",   1_000_000_000)  # $1B — liquidità opzioni
+WHEEL_OI_MIN:       int   = _int("WHEEL_OI_MIN",           1_000)   # open interest minimo
+WHEEL_IV_RANK_MIN:  float = _float("WHEEL_IV_RANK_MIN",     30.0)   # IV rank minimo %
 
 # Serenity
 SERENITY_ARCHIVE_PATH: Path = Path(os.getenv("SERENITY_ARCHIVE_PATH", "data/serenity_tweets.json"))

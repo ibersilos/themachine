@@ -39,6 +39,7 @@ def init_db() -> None:
             source      TEXT NOT NULL,          -- edgar | form4 | usaspending | serenity
             ticker      TEXT,
             score       INTEGER,
+            pipeline    TEXT DEFAULT 'unknown', -- stock_picking | wheel_candidate
             payload     TEXT,                   -- JSON blob
             alerted     INTEGER DEFAULT 0,
             created_at  TEXT DEFAULT (datetime('now'))
@@ -70,6 +71,7 @@ def init_db() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_signals_ticker ON signals(ticker);
         CREATE INDEX IF NOT EXISTS idx_signals_source ON signals(source);
+        CREATE INDEX IF NOT EXISTS idx_signals_pipeline ON signals(pipeline);
 
         -- Wheel cycle tracking per framework Hogue
         CREATE TABLE IF NOT EXISTS wheel_cycles (
@@ -91,6 +93,12 @@ def init_db() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_wheel_ticker ON wheel_cycles(ticker, year);
         """)
+        # Migrazione: aggiungi colonna pipeline se non esiste (DB pre-dual-pipeline)
+        try:
+            conn.execute("ALTER TABLE signals ADD COLUMN pipeline TEXT DEFAULT 'unknown'")
+            conn.commit()
+        except Exception:
+            pass  # colonna già presente
 
 
 # ── Risk helpers ──────────────────────────────────────────────────────────────
@@ -124,11 +132,12 @@ def is_paused() -> bool:
 
 # ── Signal helpers ────────────────────────────────────────────────────────────
 
-def save_signal(source: str, ticker: str | None, score: int, payload: str) -> int:
+def save_signal(source: str, ticker: str | None, score: int, payload: str,
+                pipeline: str = "unknown") -> int:
     with tx() as conn:
         cur = conn.execute(
-            "INSERT INTO signals (source, ticker, score, payload) VALUES (?,?,?,?)",
-            (source, ticker, score, payload),
+            "INSERT INTO signals (source, ticker, score, pipeline, payload) VALUES (?,?,?,?,?)",
+            (source, ticker, score, pipeline, payload),
         )
         return cur.lastrowid
 

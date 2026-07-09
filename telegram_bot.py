@@ -97,8 +97,11 @@ def _format_signal_alert(bd: ScoreBreakdown, signal: dict) -> str:
     ticker = bd.ticker or "N/A"
     url    = signal.get("filing_url") or signal.get("award_url") or ""
 
+    tag = bd.pipeline_tag()
+    header = f"{tag} {bd.emoji()} *{bd.tier()} — {ticker}*" if tag else f"{bd.emoji()} *{bd.tier()} — {ticker}*"
+
     lines = [
-        f"{bd.emoji()} *{bd.tier()} — {ticker}*",
+        header,
         f"Score: `{bd.total}/100` | Source: _{source}_",
         "",
     ]
@@ -153,11 +156,10 @@ def dispatch_signal(bd: ScoreBreakdown, signal: dict) -> None:
     sig_id = signal.get("_db_id")
     if sig_id:
         db.mark_alerted(sig_id)
-        # Update score in DB
         with db.tx() as conn:
             conn.execute(
-                "UPDATE signals SET score=? WHERE id=?",
-                (bd.total, sig_id),
+                "UPDATE signals SET score=?, pipeline=? WHERE id=?",
+                (bd.total, bd.pipeline, sig_id),
             )
 
 

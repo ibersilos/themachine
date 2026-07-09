@@ -26,6 +26,22 @@ def _is_fresh(ticker: str) -> bool:
     return (time.time() - fetched_at) < config.FUNDAMENTALS_CACHE_TTL
 
 
+def _fetch_total_oi(yf_ticker) -> float | None:
+    """Somma dell'open interest della prima scadenza disponibile (proxy liquidità opzioni)."""
+    try:
+        dates = yf_ticker.options
+        if not dates:
+            return None
+        chain = yf_ticker.option_chain(dates[0])
+        oi = (
+            (chain.calls["openInterest"].sum() if "openInterest" in chain.calls.columns else 0)
+            + (chain.puts["openInterest"].sum() if "openInterest" in chain.puts.columns else 0)
+        )
+        return float(oi) if oi else None
+    except Exception:
+        return None
+
+
 def get_fundamentals(ticker: str) -> dict:
     """
     Return a dict of fundamental fields for `ticker`.
@@ -41,7 +57,8 @@ def get_fundamentals(ticker: str) -> dict:
         return _cache[ticker][1]
 
     try:
-        info = yf.Ticker(ticker).info
+        yf_obj = yf.Ticker(ticker)
+        info = yf_obj.info
     except Exception as exc:
         logger.warning("yfinance fetch failed for %s: %s", ticker, exc)
         return {}
@@ -60,13 +77,17 @@ def get_fundamentals(ticker: str) -> dict:
         "current_price":   _safe_float(info.get("currentPrice") or info.get("regularMarketPrice")),
         "52w_high":        _safe_float(info.get("fiftyTwoWeekHigh")),
         "52w_low":         _safe_float(info.get("fiftyTwoWeekLow")),
+        "avg_volume":      _safe_float(info.get("averageVolume") or info.get("averageDailyVolume10Day")),
+        "open_interest":   _fetch_total_oi(yf_obj),
+        "iv_rank":         None,   # non disponibile da yfinance — richiede IBKR
     }
 
     _cache[ticker] = (time.time(), data)
-    logger.debug("Fundamentals cached for %s: pe=%.1f rev_growth=%.2f",
+    logger.debug("Fundamentals cached for %s: pe=%.1f rev_growth=%.2f vol=%.0f",
                  ticker,
                  data["pe_ratio"] or 0,
-                 data["revenue_growth"] or 0)
+                 data["revenue_growth"] or 0,
+                 data["avg_volume"] or 0)
     return data
 
 

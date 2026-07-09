@@ -1,8 +1,12 @@
 """
 Scoring engine – converts raw signal dicts into 0-100 scores.
 
-Each source contributes a partial score; they are combined with
-source-specific weights. A score >= MIN_ALERT_SCORE triggers an alert.
+Due pipeline distinte:
+  STOCK_PICKING   → form4 + usaspending  → tag [PICK]  🎯
+  WHEEL_CANDIDATE → edgar_8k + serenity  → tag [WHEEL] ⚙️
+
+Ogni pipeline ha filtri dedicati; segnali fuori range vengono scartati
+silenziosamente (filtered=True) senza alert Telegram.
 """
 import logging
 from dataclasses import dataclass, field
@@ -10,6 +14,14 @@ from dataclasses import dataclass, field
 import config
 
 logger = logging.getLogger(__name__)
+
+# Mapping source → pipeline
+_PIPELINE_MAP: dict[str, str] = {
+    "form4":       "stock_picking",
+    "usaspending": "stock_picking",
+    "edgar_8k":    "wheel_candidate",
+    "serenity":    "wheel_candidate",
+}
 
 # ── Weights (must sum to 1.0) ─────────────────────────────────────────────────
 WEIGHTS = {
@@ -24,10 +36,11 @@ WEIGHTS = {
 @dataclass
 class ScoreBreakdown:
     ticker: str | None
+    pipeline: str = "unknown"      # stock_picking | wheel_candidate
     total: int = 0
     components: dict[str, int] = field(default_factory=dict)
     flags: list[str] = field(default_factory=list)
-    filtered: bool = False        # True → segnale scartato per market cap
+    filtered: bool = False         # True → segnale scartato — nessun alert
 
     def tier(self) -> str:
         if self.total >= config.STRONG_BUY_THRESHOLD:
@@ -40,11 +53,75 @@ class ScoreBreakdown:
         t = self.tier()
         return {"STRONG BUY": "🔥", "BUY ALERT": "📡", "WATCH": "👁"}.get(t, "")
 
+    def pipeline_tag(self) -> str:
+        if self.pipeline == "stock_picking":
+            return "[PICK] 🎯"
+        if self.pipeline == "wheel_candidate":
+            return "[WHEEL] ⚙️"
+        return ""
+
+
+# ── Pipeline filters ──────────────────────────────────────────────────────────
+
+def _filter_stock_picking(signal: dict, ticker: str | None) -> bool:
+    """Ritorna True (= scartare) se il segnale non soddisfa i criteri PICK."""
+    t = ticker or "—"
+
+    cap = signal.get("market_cap")
+    if cap is not None:
+        if cap < config.PICK_CAP_MIN:
+            logger.info("[PICK] %s scartata: cap $%.0fM < min $%.0fM (micro cap)",
+                        t, cap / 1e6, config.PICK_CAP_MIN / 1e6)
+            return True
+        if cap > config.PICK_CAP_MAX:
+            logger.info("[PICK] %s scartata: cap $%.0fB > max $%.0fM",
+                        t, cap / 1e9, config.PICK_CAP_MAX / 1e6)
+            return True
+
+    price = signal.get("current_price")
+    if price is not None:
+        if price < config.PICK_PRICE_MIN or price > config.PICK_PRICE_MAX:
+            logger.info("[PICK] %s scartata: prezzo $%.2f fuori range $%.0f-$%.0f",
+                        t, price, config.PICK_PRICE_MIN, config.PICK_PRICE_MAX)
+            return True
+
+    vol = signal.get("avg_volume")
+    if vol is not None and vol < config.PICK_VOL_MIN:
+        logger.info("[PICK] %s scartata: volume %.0f/day < min %.0f",
+                    t, vol, config.PICK_VOL_MIN)
+        return True
+
+    return False
+
+
+def _filter_wheel_candidate(signal: dict, ticker: str | None) -> bool:
+    """Ritorna True (= scartare) se il segnale non soddisfa i criteri WHEEL."""
+    t = ticker or "—"
+
+    cap = signal.get("market_cap")
+    if cap is not None and cap < config.WHEEL_CAP_MIN:
+        logger.info("[WHEEL] %s scartata: cap $%.0fM < min $%.0fB",
+                    t, cap / 1e6, config.WHEEL_CAP_MIN / 1e9)
+        return True
+
+    oi = signal.get("open_interest")
+    if oi is not None and oi < config.WHEEL_OI_MIN:
+        logger.info("[WHEEL] %s scartata: OI %.0f < min %.0f",
+                    t, oi, config.WHEEL_OI_MIN)
+        return True
+
+    iv_rank = signal.get("iv_rank")
+    if iv_rank is not None and iv_rank < config.WHEEL_IV_RANK_MIN:
+        logger.info("[WHEEL] %s scartata: IV rank %.1f%% < min %.0f%%",
+                    t, iv_rank, config.WHEEL_IV_RANK_MIN)
+        return True
+
+    return False
+
 
 # ── Per-source scorers ────────────────────────────────────────────────────────
 
 def _score_edgar_8k(signal: dict) -> tuple[int, list[str]]:
-    """0-100 sub-score for an 8-K signal."""
     score = 0
     flags = []
 
@@ -64,12 +141,10 @@ def _score_edgar_8k(signal: dict) -> tuple[int, list[str]]:
         score += 20
         flags.append("8-K: high-value item detected")
 
-    # Earnings / results of operations – very high signal
     if "2.02" in hv:
         score = min(score + 20, 100)
         flags.append("Earnings report (2.02)")
 
-    # Bankruptcy is a sell signal – negative
     if "1.03" in hv:
         score = max(score - 40, 0)
         flags.append("⚠️ Bankruptcy/receivership (1.03)")
@@ -78,12 +153,10 @@ def _score_edgar_8k(signal: dict) -> tuple[int, list[str]]:
 
 
 def _score_form4(signal: dict) -> tuple[int, list[str]]:
-    """0-100 sub-score for a Form-4 signal."""
     score = 0
     flags = []
     title = signal.get("filing_title", "").lower()
 
-    # form4_monitor enriches signals with transaction_type; fall back to title
     tx_type = signal.get("transaction_type", "")
     amount  = signal.get("transaction_value_usd", 0) or 0
 
@@ -107,7 +180,6 @@ def _score_form4(signal: dict) -> tuple[int, list[str]]:
 
 
 def _score_usaspending(signal: dict) -> tuple[int, list[str]]:
-    """0-100 sub-score for a USAspending contract award signal."""
     score = 0
     flags = []
 
@@ -115,19 +187,19 @@ def _score_usaspending(signal: dict) -> tuple[int, list[str]]:
 
     if amount >= 1_000_000_000:
         score = 90
-        flags.append(f"$1B+ contract award")
+        flags.append("$1B+ contract award")
     elif amount >= 500_000_000:
         score = 75
-        flags.append(f"$500M+ contract")
+        flags.append("$500M+ contract")
     elif amount >= 100_000_000:
         score = 55
-        flags.append(f"$100M+ contract")
+        flags.append("$100M+ contract")
     elif amount >= 10_000_000:
         score = 35
-        flags.append(f"$10M+ contract")
+        flags.append("$10M+ contract")
     else:
         score = 15
-        flags.append(f"Contract <$10M")
+        flags.append("Contract <$10M")
 
     if signal.get("is_new_award"):
         score = min(score + 10, 100)
@@ -137,11 +209,10 @@ def _score_usaspending(signal: dict) -> tuple[int, list[str]]:
 
 
 def _score_serenity(signal: dict) -> tuple[int, list[str]]:
-    """0-100 sub-score for a serenity validation signal."""
     score = 0
     flags = []
 
-    confidence = signal.get("serenity_confidence", 0)  # 0-1 float
+    confidence = signal.get("serenity_confidence", 0)
     score = int(confidence * 100)
 
     if signal.get("serenity_recent_mention"):
@@ -160,7 +231,6 @@ def _score_serenity(signal: dict) -> tuple[int, list[str]]:
 
 
 def _score_fundamentals(signal: dict) -> tuple[int, list[str]]:
-    """0-100 sub-score from yfinance fundamental data attached to signal."""
     score = 0
     flags = []
 
@@ -172,7 +242,7 @@ def _score_fundamentals(signal: dict) -> tuple[int, list[str]]:
         score += 15
         flags.append(f"PE={pe:.1f} (very low)")
 
-    rev_growth = signal.get("revenue_growth")  # as fraction, e.g. 0.15 = 15%
+    rev_growth = signal.get("revenue_growth")
     if rev_growth and rev_growth > 0.20:
         score += 30
         flags.append(f"Revenue growth {rev_growth*100:.0f}%")
@@ -192,10 +262,10 @@ def _score_fundamentals(signal: dict) -> tuple[int, list[str]]:
 
 
 _SCORERS = {
-    "edgar_8k":    _score_edgar_8k,
-    "form4":       _score_form4,
-    "usaspending": _score_usaspending,
-    "serenity":    _score_serenity,
+    "edgar_8k":     _score_edgar_8k,
+    "form4":        _score_form4,
+    "usaspending":  _score_usaspending,
+    "serenity":     _score_serenity,
     "fundamentals": _score_fundamentals,
 }
 
@@ -205,41 +275,27 @@ _SCORERS = {
 def score_signal(signal: dict) -> ScoreBreakdown:
     """
     Compute a composite score for a raw signal dict.
-    The signal must have a 'source' key matching one of the scorers.
-    Supplementary data (fundamentals, serenity) is attached in-place
-    by their respective monitors before calling this function.
-
-    Se market cap è fuori range [MARKET_CAP_MIN, MARKET_CAP_MAX],
-    ritorna ScoreBreakdown con filtered=True — il chiamante deve scartare.
+    Rileva automaticamente la pipeline dalla sorgente e applica i filtri
+    corrispondenti. Se il segnale non supera i filtri, ritorna
+    ScoreBreakdown con filtered=True — il chiamante deve scartare.
     """
     source = signal.get("source", "unknown")
     ticker = signal.get("ticker")
-    bd = ScoreBreakdown(ticker=ticker)
+    pipeline = _PIPELINE_MAP.get(source, "unknown")
 
-    # ── Filtro market cap ─────────────────────────────────────────────────────
-    market_cap = signal.get("market_cap")
-    if market_cap is not None:
-        cap_b = market_cap / 1_000_000_000  # in miliardi per il log
-        if market_cap > config.MARKET_CAP_MAX:
-            logger.info(
-                "%s scartata: market cap $%.0fB > soglia $%.0fM",
-                ticker or "—",
-                cap_b,
-                config.MARKET_CAP_MAX / 1_000_000,
-            )
+    bd = ScoreBreakdown(ticker=ticker, pipeline=pipeline)
+
+    # ── Filtri pipeline ───────────────────────────────────────────────────────
+    if pipeline == "stock_picking":
+        if _filter_stock_picking(signal, ticker):
             bd.filtered = True
             return bd
-        if market_cap < config.MARKET_CAP_MIN:
-            logger.info(
-                "%s scartata: market cap $%.0fM < minimo $%.0fM (micro cap)",
-                ticker or "—",
-                market_cap / 1_000_000,
-                config.MARKET_CAP_MIN / 1_000_000,
-            )
+    elif pipeline == "wheel_candidate":
+        if _filter_wheel_candidate(signal, ticker):
             bd.filtered = True
             return bd
 
-    # Primary source score
+    # ── Scoring ───────────────────────────────────────────────────────────────
     scorer = _SCORERS.get(source)
     if scorer:
         raw, flags = scorer(signal)
@@ -250,7 +306,6 @@ def score_signal(signal: dict) -> ScoreBreakdown:
     else:
         logger.warning("Unknown signal source: %s", source)
 
-    # Supplementary scores always applied when data is present
     for supplementary in ("serenity", "fundamentals"):
         if supplementary == source:
             continue
@@ -263,5 +318,5 @@ def score_signal(signal: dict) -> ScoreBreakdown:
             bd.total += int(raw * w)
 
     bd.total = min(bd.total, 100)
-    logger.debug("Score %s [%s]: %d – %s", ticker, source, bd.total, bd.flags)
+    logger.debug("Score %s [%s/%s]: %d – %s", ticker, source, pipeline, bd.total, bd.flags)
     return bd
