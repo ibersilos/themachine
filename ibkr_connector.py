@@ -39,9 +39,8 @@ import database as db
 from covered_call_optimizer import WheelPosition
 
 logger = logging.getLogger(__name__)
-
-# ── Monkey-patch asyncio per compatibilità con thread non-async ───────────────
-util.patchAsyncio()
+# util.patchAsyncio() rimosso: rompe asyncio.run() nel thread Telegram
+# (non serve: usiamo solo metodi sync di ib_insync, non async/await)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
