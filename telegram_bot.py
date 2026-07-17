@@ -232,17 +232,28 @@ async def _cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 def run_bot_in_thread() -> None:
     """Start the Telegram bot in a background daemon thread."""
     def _run():
-        app = (
-            Application.builder()
-            .token(config.TELEGRAM_BOT_TOKEN)
-            .build()
-        )
-        app.add_handler(CommandHandler("status",  _cmd_status))
-        app.add_handler(CommandHandler("signals", _cmd_signals))
-        app.add_handler(CommandHandler("risk",    _cmd_risk))
+        import asyncio
+        # Ogni thread ha bisogno del proprio event loop (ibkr_connector ne setta
+        # uno globale sul thread principale che causerebbe conflitti qui)
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-        logger.info("Telegram bot polling started")
-        app.run_polling(drop_pending_updates=True)
+        try:
+            app = (
+                Application.builder()
+                .token(config.TELEGRAM_BOT_TOKEN)
+                .build()
+            )
+            app.add_handler(CommandHandler("status",  _cmd_status))
+            app.add_handler(CommandHandler("signals", _cmd_signals))
+            app.add_handler(CommandHandler("risk",    _cmd_risk))
+
+            logger.info("Telegram bot polling started")
+            app.run_polling(drop_pending_updates=True)
+        except Exception as exc:
+            logger.error("Telegram bot crashed: %s", exc, exc_info=True)
+        finally:
+            loop.close()
 
     t = threading.Thread(target=_run, name="telegram-bot", daemon=True)
     t.start()
