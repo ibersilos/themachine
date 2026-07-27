@@ -80,39 +80,123 @@ def check_monthly_drawdown(delta_pct: float) -> None:
 
 # ── Alert formatting ──────────────────────────────────────────────────────────
 
-def _format_signal_alert(bd: ScoreBreakdown, signal: dict) -> str:
-    source_labels = {
-        "edgar_8k":    "SEC 8-K",
-        "form4":       "Form 4 Insider",
-        "usaspending": "USAspending Contract",
-        "serenity":    "Serenity Archive",
-    }
-    source = source_labels.get(signal.get("source", ""), signal.get("source", "unknown"))
-    ticker = bd.ticker or "N/A"
-    url    = signal.get("filing_url") or signal.get("award_url") or ""
+def _fmt_cap(cap) -> str:
+    if cap is None:
+        return "N/A"
+    if cap >= 1_000_000_000:
+        return f"${cap/1e9:.1f}B"
+    return f"${cap/1e6:.0f}M"
 
-    tag = bd.pipeline_tag()
-    header = f"{tag} {bd.emoji()} *{bd.tier()} — {ticker}*" if tag else f"{bd.emoji()} *{bd.tier()} — {ticker}*"
+
+def _fmt_vol(vol) -> str:
+    if vol is None:
+        return "N/A"
+    if vol >= 1_000_000:
+        return f"{vol/1e6:.1f}M"
+    return f"{vol/1_000:.0f}K"
+
+
+def _52w_bar(price, low, high, width=10) -> str:
+    if not price or not low or not high or high <= low:
+        return ""
+    pct = (price - low) / (high - low)
+    filled = round(pct * width)
+    bar = "█" * filled + "░" * (width - filled)
+    return f"`{bar}` {pct*100:.0f}%"
+
+
+def _format_pick_alert(bd: ScoreBreakdown, signal: dict) -> str:
+    """Layout stock scanner per pipeline STOCK_PICKING."""
+    ticker  = bd.ticker or "N/A"
+    url     = signal.get("filing_url") or signal.get("award_url") or ""
+    source_labels = {"form4": "Form 4 Insider", "usaspending": "USAspending"}
+    source  = source_labels.get(signal.get("source", ""), signal.get("source", ""))
+
+    price   = signal.get("current_price")
+    cap     = signal.get("market_cap")
+    vol     = signal.get("avg_volume")
+    low52   = signal.get("52w_low")
+    high52  = signal.get("52w_high")
+    bar     = _52w_bar(price, low52, high52)
 
     lines = [
-        header,
-        f"Score: `{bd.total}/100` | Source: _{source}_",
-        "",
+        f"🎯 *[PICK] {bd.tier()} — {ticker}*",
+        f"Score: `{bd.total}/100`  |  {source}",
+        "─────────────────────────",
+        f"💰 Prezzo:   `{'$%.2f' % price if price else 'N/A'}`",
+        f"📊 Volume:   `{_fmt_vol(vol)}/day`",
+        f"🏦 Cap:      `{_fmt_cap(cap)}`",
     ]
-
+    if bar:
+        lines.append(f"📈 52w:      {bar}")
+        if low52 and high52:
+            lines.append(f"            `${low52:.2f}` ── `${high52:.2f}`")
+    lines.append("─────────────────────────")
     if bd.flags:
-        lines.append("*Signals detected:*")
         for f in bd.flags:
             lines.append(f"  • {f}")
-        lines.append("")
-
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    lines.append(f"\n🕐 `{ts}`")
     if url:
         lines.append(f"[View filing]({url})")
+    return "\n".join(lines)
 
-    filing_title = signal.get("filing_title") or signal.get("award_description", "")
-    if filing_title:
-        lines.append(f"_{filing_title[:120]}_")
 
+def _format_wheel_alert(bd: ScoreBreakdown, signal: dict) -> str:
+    """Layout options desk per pipeline WHEEL_CANDIDATES."""
+    ticker  = bd.ticker or "N/A"
+    url     = signal.get("filing_url") or signal.get("award_url") or ""
+    source_labels = {"edgar_8k": "SEC 8-K", "serenity": "Serenity"}
+    source  = source_labels.get(signal.get("source", ""), signal.get("source", ""))
+
+    iv_rank = signal.get("iv_rank")
+    oi      = signal.get("open_interest")
+    cap     = signal.get("market_cap")
+    price   = signal.get("current_price")
+    sector  = signal.get("sector") or ""
+
+    iv_str  = f"{iv_rank:.0f}%  ← vendi premium" if iv_rank else "N/A  (IBKR offline)"
+    oi_str  = f"{oi:,.0f}" if oi else "N/A"
+
+    lines = [
+        f"⚙️ *[WHEEL] {bd.tier()} — {ticker}*",
+        f"Score: `{bd.total}/100`  |  {source}",
+        "─────────────────────────",
+        f"🎰 IV Rank:  `{iv_str}`",
+        f"📋 OI tot:   `{oi_str}`",
+        f"💵 Prezzo:   `{'$%.2f' % price if price else 'N/A'}`",
+        f"🏦 Cap:      `{_fmt_cap(cap)}`",
+    ]
+    if sector:
+        lines.append(f"🏭 Settore:  `{sector}`")
+    lines.append("─────────────────────────")
+    if bd.flags:
+        for f in bd.flags:
+            lines.append(f"  • {f}")
+    ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    lines.append(f"\n🕐 `{ts}`")
+    if url:
+        lines.append(f"[View filing]({url})")
+    return "\n".join(lines)
+
+
+def _format_signal_alert(bd: ScoreBreakdown, signal: dict) -> str:
+    if bd.pipeline == "stock_picking":
+        return _format_pick_alert(bd, signal)
+    if bd.pipeline == "wheel_candidate":
+        return _format_wheel_alert(bd, signal)
+    # fallback generico
+    ticker = bd.ticker or "N/A"
+    url    = signal.get("filing_url") or signal.get("award_url") or ""
+    lines  = [
+        f"{bd.emoji()} *{bd.tier()} — {ticker}*",
+        f"Score: `{bd.total}/100`",
+        "",
+    ]
+    for f in bd.flags:
+        lines.append(f"  • {f}")
+    if url:
+        lines.append(f"\n[View filing]({url})")
     lines.append(f"\n🕐 `{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}`")
     return "\n".join(lines)
 
