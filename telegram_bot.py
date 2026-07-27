@@ -14,7 +14,8 @@ import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from telegram import Bot, Update
+import httpx
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
 
@@ -24,14 +25,7 @@ from scoring_engine import ScoreBreakdown
 
 logger = logging.getLogger(__name__)
 
-_bot_instance: Bot | None = None
-
-
-def _get_bot() -> Bot:
-    global _bot_instance
-    if _bot_instance is None:
-        _bot_instance = Bot(token=config.TELEGRAM_BOT_TOKEN)
-    return _bot_instance
+_TG_API = f"https://api.telegram.org/bot{config.TELEGRAM_BOT_TOKEN}"
 
 
 # ── Kill-switch enforcement ───────────────────────────────────────────────────
@@ -126,14 +120,15 @@ def _format_signal_alert(bd: ScoreBreakdown, signal: dict) -> str:
 # ── Public send functions ─────────────────────────────────────────────────────
 
 def send_alert(text: str) -> None:
-    """Fire-and-forget alert to the configured chat."""
+    """Fire-and-forget alert — httpx sync, funziona da qualsiasi thread/contesto."""
     try:
-        _get_bot().send_message(
-            chat_id=config.TELEGRAM_CHAT_ID,
-            text=text,
-            parse_mode=ParseMode.MARKDOWN,
-            disable_web_page_preview=True,
-        )
+        with httpx.Client(timeout=10) as client:
+            client.post(f"{_TG_API}/sendMessage", json={
+                "chat_id": config.TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "Markdown",
+                "disable_web_page_preview": True,
+            })
     except Exception as exc:
         logger.error("Telegram send failed: %s", exc)
 
