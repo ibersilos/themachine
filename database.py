@@ -71,7 +71,6 @@ def init_db() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_signals_ticker ON signals(ticker);
         CREATE INDEX IF NOT EXISTS idx_signals_source ON signals(source);
-        CREATE INDEX IF NOT EXISTS idx_signals_pipeline ON signals(pipeline);
 
         -- Wheel cycle tracking per framework Hogue
         CREATE TABLE IF NOT EXISTS wheel_cycles (
@@ -99,6 +98,12 @@ def init_db() -> None:
             conn.commit()
         except Exception:
             pass  # colonna già presente
+        # Indice su pipeline creato dopo la migration (evita errore su DB vecchi)
+        try:
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_pipeline ON signals(pipeline)")
+            conn.commit()
+        except Exception:
+            pass
 
 
 # ── Risk helpers ──────────────────────────────────────────────────────────────
