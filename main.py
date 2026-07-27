@@ -22,6 +22,7 @@ import form4_monitor
 import serenity_validator
 import fundamentals
 import scoring_engine
+import wheel_scanner
 import telegram_bot
 import drive_export
 import api_server
@@ -54,6 +55,16 @@ def _enrich(sig: dict) -> dict:
     # Serenity + Fundamentals always
     sig = serenity_validator.enrich_signal(sig)
     sig = fundamentals.enrich_signal(sig)
+
+    # WHEEL pipeline: esegui options scan (3-tier wheel-scout + VRP stockpile)
+    if source in ("edgar_8k", "serenity") and sig.get("ticker"):
+        ws = wheel_scanner.scan_wheel_candidate(sig["ticker"])
+        if ws:
+            sig["wheel_scan"] = ws
+            sig["vrp"]        = ws.vrp
+            sig["atm_iv"]     = ws.atm_iv
+            sig["hv_20"]      = ws.hv_20
+            sig["iv_rank"]    = None  # non da yfinance, usiamo VRP
 
     return sig
 

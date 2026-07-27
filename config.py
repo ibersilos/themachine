@@ -48,10 +48,17 @@ PICK_VOL_MIN:   int   = _int("PICK_VOL_MIN",       200_000)   # volume medio gio
 PICK_PRICE_MIN: float = _float("PICK_PRICE_MIN",       2.0)   # prezzo minimo $
 PICK_PRICE_MAX: float = _float("PICK_PRICE_MAX",      25.0)   # prezzo massimo $
 
-# WHEEL_CANDIDATES (fonti: edgar_8k + serenity)
+# WHEEL_CANDIDATES (fonti: edgar_8k + serenity) — filtri base scoring_engine
 WHEEL_CAP_MIN:      int   = _int("WHEEL_CAP_MIN",   1_000_000_000)  # $1B — liquidità opzioni
-WHEEL_OI_MIN:       int   = _int("WHEEL_OI_MIN",           1_000)   # open interest minimo
-WHEEL_IV_RANK_MIN:  float = _float("WHEEL_IV_RANK_MIN",     30.0)   # IV rank minimo %
+WHEEL_OI_MIN:       int   = _int("WHEEL_OI_MIN",             100)   # OI minimo per strike
+WHEEL_VRP_MIN:      float = _float("WHEEL_VRP_MIN",           1.1)  # VRP min (IV/HV20) — stockpile
+
+# WHEEL_CANDIDATES — parametri wheel_scanner (3-tier, ispirato wheel-scout + stockpile)
+WHEEL_DTE_MIN:          int   = _int("WHEEL_DTE_MIN",           14)   # DTE minimo
+WHEEL_DTE_MAX:          int   = _int("WHEEL_DTE_MAX",           42)   # DTE massimo
+WHEEL_MAX_SPREAD_PCT:   float = _float("WHEEL_MAX_SPREAD_PCT",  0.10) # max spread bid-ask %
+WHEEL_MIN_PREMIUM:      float = _float("WHEEL_MIN_PREMIUM",     0.30) # premio minimo $/contratto
+WHEEL_ANN_RETURN_MIN:   float = _float("WHEEL_ANN_RETURN_MIN",  15.0) # rendimento annualizzato min %
 
 # Serenity
 SERENITY_ARCHIVE_PATH: Path = Path(os.getenv("SERENITY_ARCHIVE_PATH", "data/serenity_tweets.json"))

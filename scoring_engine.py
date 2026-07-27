@@ -98,22 +98,27 @@ def _filter_wheel_candidate(signal: dict, ticker: str | None) -> bool:
     """Ritorna True (= scartare) se il segnale non soddisfa i criteri WHEEL."""
     t = ticker or "—"
 
+    # Market cap minimo $1B (liquidità opzioni garantita)
     cap = signal.get("market_cap")
     if cap is not None and cap < config.WHEEL_CAP_MIN:
         logger.info("[WHEEL] %s scartata: cap $%.0fM < min $%.0fB",
                     t, cap / 1e6, config.WHEEL_CAP_MIN / 1e9)
         return True
 
-    oi = signal.get("open_interest")
-    if oi is not None and oi < config.WHEEL_OI_MIN:
-        logger.info("[WHEEL] %s scartata: OI %.0f < min %.0f",
-                    t, oi, config.WHEEL_OI_MIN)
+    # VRP (IV/HV20) — logica stockpile: se disponibile e troppo basso, scarta
+    vrp = signal.get("vrp")
+    if vrp is not None and vrp < config.WHEEL_VRP_MIN:
+        logger.info("[WHEEL] %s scartata: VRP %.2f < min %.1f (premium non elevato)",
+                    t, vrp, config.WHEEL_VRP_MIN)
         return True
 
-    iv_rank = signal.get("iv_rank")
-    if iv_rank is not None and iv_rank < config.WHEEL_IV_RANK_MIN:
-        logger.info("[WHEEL] %s scartata: IV rank %.1f%% < min %.0f%%",
-                    t, iv_rank, config.WHEEL_IV_RANK_MIN)
+    # Wheel scan: se non ci sono candidati put validi, scarta
+    ws = signal.get("wheel_scan")
+    if ws is not None and ws.candidates_count == 0:
+        reason = "earnings in finestra" if ws.earnings_in_window else \
+                 "sotto 50-SMA" if not ws.above_sma50 else \
+                 "nessuna put supera i filtri"
+        logger.info("[WHEEL] %s scartata: %s", t, reason)
         return True
 
     return False
@@ -309,6 +314,8 @@ def score_signal(signal: dict) -> ScoreBreakdown:
     for supplementary in ("serenity", "fundamentals"):
         if supplementary == source:
             continue
+        if supplementary == "serenity" and not signal.get("serenity_confidence", 0):
+            continue  # nessun dato Serenity — skip senza penalità
         s_scorer = _SCORERS[supplementary]
         raw, flags = s_scorer(signal)
         if raw > 0:

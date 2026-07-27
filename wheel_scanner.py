@@ -1,0 +1,262 @@
+"""
+wheel_scanner.py — 3-tier options scanner per WHEEL_CANDIDATE signals.
+
+Ispirato a:
+  - wheel-scout (MiniGioLabs/wheel-scout): filtri hard/profit/quality
+  - stockpile/options-scanner (medloh/stockpile): VRP scoring via IV surface
+
+Usa solo yfinance — nessuna API a pagamento richiesta.
+Chiamato da main.py dopo che un segnale ha passato i filtri base WHEEL.
+
+Output principale: la miglior put da vendere (strike, scadenza, premio,
+annualized return) + VRP per valutare se il premio è alto rispetto alla
+volatilità realizzata.
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from datetime import date, datetime
+
+import numpy as np
+import pandas as pd
+import yfinance as yf
+
+import config
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class PutCandidate:
+    strike: float
+    expiry: str           # YYYY-MM-DD
+    dte: int
+    bid: float
+    ask: float
+    mid: float
+    iv: float             # implied volatility (frazione, es: 0.45 = 45%)
+    open_interest: int
+    volume: int
+    spread_pct: float     # (ask-bid)/mid
+    annualized_return: float  # (mid/strike)*(365/dte)*100
+
+
+@dataclass
+class WheelScanResult:
+    ticker: str
+    best_put: PutCandidate | None = None
+    vrp: float | None = None           # ATM_IV / HV_20 (>1 = premium elevato)
+    hv_20: float | None = None         # 20-day historical volatility annualizzata
+    atm_iv: float | None = None        # implied vol ATM media
+    earnings_in_window: bool = False
+    next_earnings: str | None = None   # YYYY-MM-DD
+    above_sma50: bool = True
+    candidates_count: int = 0
+    error: str | None = None
+
+
+# ── Funzione principale ────────────────────────────────────────────────────────
+
+def scan_wheel_candidate(ticker: str) -> WheelScanResult | None:
+    """
+    Scansiona le put options di un ticker e trova il miglior candidato wheel.
+
+    Tier 1 (hard):    OI, spread bid-ask, DTE nel range
+    Tier 2 (profit):  premium minimo, annualized return minimo
+    Tier 3 (quality): above 50-SMA, no earnings nella finestra
+
+    VRP = ATM_IV / HV_20 — dalla logica stockpile options-scanner:
+      se VRP > 1 il mercato prezza più rischio di quanto lo stock si muova
+      → premium sale è favorevole.
+
+    Ritorna None su errore fatale, WheelScanResult con best_put=None se
+    nessun candidato supera i filtri.
+    """
+    try:
+        yf_obj = yf.Ticker(ticker)
+        info   = yf_obj.info or {}
+        spot   = _safe_float(info.get("currentPrice") or info.get("regularMarketPrice"))
+
+        if not spot or spot <= 0:
+            return WheelScanResult(ticker=ticker, error="prezzo non disponibile")
+
+        # ── Dati storici per HV20 e SMA50 ────────────────────────────────────
+        hist    = yf_obj.history(period="70d")
+        hv_20   = _compute_hv(hist, window=20)
+        sma50   = _safe_float(info.get("fiftyDayAverage"))
+        above_sma50 = (spot >= sma50) if sma50 else True
+
+        # ── Earnings check ────────────────────────────────────────────────────
+        next_earnings, earnings_in_window = _check_earnings(
+            yf_obj, config.WHEEL_DTE_MAX
+        )
+
+        # ── Catena opzioni ────────────────────────────────────────────────────
+        option_dates = yf_obj.options
+        if not option_dates:
+            return WheelScanResult(
+                ticker=ticker, hv_20=hv_20,
+                above_sma50=above_sma50,
+                next_earnings=next_earnings,
+                earnings_in_window=earnings_in_window,
+                error="nessuna opzione disponibile",
+            )
+
+        today = date.today()
+        candidates: list[PutCandidate] = []
+        atm_ivs: list[float] = []
+
+        for exp_str in option_dates:
+            try:
+                exp_date = date.fromisoformat(exp_str)
+            except ValueError:
+                continue
+            dte = (exp_date - today).days
+            if not (config.WHEEL_DTE_MIN <= dte <= config.WHEEL_DTE_MAX):
+                continue
+
+            try:
+                chain = yf_obj.option_chain(exp_str)
+                puts  = chain.puts
+            except Exception as exc:
+                logger.debug("wheel_scanner: option_chain %s %s: %s", ticker, exp_str, exc)
+                continue
+
+            for _, row in puts.iterrows():
+                strike = _safe_float(row.get("strike")) or 0.0
+                bid    = _safe_float(row.get("bid")) or 0.0
+                ask    = _safe_float(row.get("ask")) or 0.0
+                oi     = _safe_int(row.get("openInterest"))
+                vol    = _safe_int(row.get("volume"))
+                iv     = _safe_float(row.get("impliedVolatility")) or 0.0
+
+                if strike <= 0 or ask <= 0:
+                    continue
+
+                mid        = (bid + ask) / 2
+                spread_pct = (ask - bid) / mid if mid > 0 else 1.0
+                ann_ret    = (mid / strike) * (365 / dte) * 100 if dte > 0 else 0.0
+
+                # Solo put OTM: CSP = vendere sotto mercato (strike 75%-100% di spot)
+                if strike >= spot * 1.01 or strike < spot * 0.75:
+                    continue
+
+                # Tier 1: hard filters (wheel-scout)
+                if oi > 0 and oi < config.WHEEL_OI_MIN:
+                    continue
+                if spread_pct > config.WHEEL_MAX_SPREAD_PCT:
+                    continue
+
+                # Tier 2: profitability (wheel-scout)
+                if mid < config.WHEEL_MIN_PREMIUM:
+                    continue
+                if ann_ret < config.WHEEL_ANN_RETURN_MIN:
+                    continue
+
+                # Raccogli IV attorno al ATM (±5% dello spot) per VRP
+                if iv > 0 and abs(strike - spot) / spot <= 0.05:
+                    atm_ivs.append(iv)
+
+                candidates.append(PutCandidate(
+                    strike=strike, expiry=exp_str, dte=dte,
+                    bid=bid, ask=ask, mid=mid, iv=iv,
+                    open_interest=oi, volume=vol,
+                    spread_pct=spread_pct,
+                    annualized_return=round(ann_ret, 2),
+                ))
+
+        # ── VRP (logica stockpile) ────────────────────────────────────────────
+        atm_iv = float(np.mean(atm_ivs)) if atm_ivs else None
+        vrp    = (atm_iv / hv_20) if (atm_iv and hv_20 and hv_20 > 0) else None
+
+        # Tier 3: qualità (wheel-scout)
+        if not above_sma50:
+            logger.info("[WHEEL] %s: sotto 50-SMA — candidati scartati", ticker)
+            candidates = []
+
+        if earnings_in_window:
+            logger.info("[WHEEL] %s: earnings nella finestra DTE — candidati scartati", ticker)
+            candidates = []
+
+        # Rank per annualized return (stockpile: ordine per IV excess, qui ann.ret)
+        candidates.sort(key=lambda c: c.annualized_return, reverse=True)
+        best = candidates[0] if candidates else None
+
+        logger.info(
+            "wheel_scanner %s: %d candidati, VRP=%.2f, best=%s",
+            ticker, len(candidates),
+            vrp or 0,
+            f"${best.strike:.0f} {best.expiry} {best.annualized_return:.1f}%" if best else "nessuno",
+        )
+
+        return WheelScanResult(
+            ticker=ticker,
+            best_put=best,
+            vrp=vrp,
+            hv_20=hv_20,
+            atm_iv=atm_iv,
+            earnings_in_window=earnings_in_window,
+            next_earnings=next_earnings,
+            above_sma50=above_sma50,
+            candidates_count=len(candidates),
+        )
+
+    except Exception as exc:
+        logger.warning("wheel_scanner.scan_wheel_candidate(%s): %s", ticker, exc)
+        return WheelScanResult(ticker=ticker, error=str(exc))
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _compute_hv(hist: pd.DataFrame, window: int = 20) -> float | None:
+    """Historical volatility annualizzata (std log-returns × √252)."""
+    try:
+        if hist is None or hist.empty:
+            return None
+        # yfinance può restituire MultiIndex — prendi la colonna Close
+        if isinstance(hist.columns, pd.MultiIndex):
+            closes = hist["Close"].iloc[:, 0].dropna()
+        else:
+            closes = hist["Close"].dropna()
+        if len(closes) < window + 1:
+            return None
+        log_ret = np.log(closes / closes.shift(1)).dropna()
+        hv = float(log_ret.tail(window).std() * np.sqrt(252))
+        return hv if hv > 0 else None
+    except Exception as e:
+        logger.debug("_compute_hv error: %s", e)
+        return None
+
+
+def _check_earnings(yf_obj, dte_max: int) -> tuple[str | None, bool]:
+    """Ritorna (next_earnings_date_iso, in_window) usando yfinance earnings_dates."""
+    try:
+        ed = yf_obj.earnings_dates
+        if ed is None or ed.empty:
+            return None, False
+        now_utc = pd.Timestamp.now(tz="UTC")
+        future  = ed[ed.index > now_utc]
+        if future.empty:
+            return None, False
+        next_e  = future.index[0].date()
+        days    = (next_e - date.today()).days
+        return next_e.isoformat(), 0 <= days <= dte_max
+    except Exception:
+        return None, False
+
+
+def _safe_float(val) -> float | None:
+    try:
+        v = float(val) if val is not None else None
+        return None if (v is not None and v != v) else v  # NaN check
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(val) -> int:
+    try:
+        v = float(val) if val is not None else 0.0
+        return int(v) if v == v else 0  # NaN → 0
+    except (TypeError, ValueError):
+        return 0

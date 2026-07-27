@@ -149,26 +149,50 @@ def _format_wheel_alert(bd: ScoreBreakdown, signal: dict) -> str:
     source_labels = {"edgar_8k": "SEC 8-K", "serenity": "Serenity"}
     source  = source_labels.get(signal.get("source", ""), signal.get("source", ""))
 
-    iv_rank = signal.get("iv_rank")
-    oi      = signal.get("open_interest")
-    cap     = signal.get("market_cap")
-    price   = signal.get("current_price")
-    sector  = signal.get("sector") or ""
+    cap    = signal.get("market_cap")
+    price  = signal.get("current_price")
+    sector = signal.get("sector") or ""
+    vrp    = signal.get("vrp")
+    hv_20  = signal.get("hv_20")
+    atm_iv = signal.get("atm_iv")
+    ws     = signal.get("wheel_scan")   # WheelScanResult
 
-    iv_str  = f"{iv_rank:.0f}%  ← vendi premium" if iv_rank else "N/A  (IBKR offline)"
-    oi_str  = f"{oi:,.0f}" if oi else "N/A"
+    # VRP line (logica stockpile: IV/HV20)
+    if vrp is not None and atm_iv is not None and hv_20 is not None:
+        vrp_str = f"{vrp:.2f}x  (IV {atm_iv*100:.0f}% vs HV20 {hv_20*100:.0f}%)"
+    elif vrp is not None:
+        vrp_str = f"{vrp:.2f}x"
+    else:
+        vrp_str = "N/A  (calcolo post-scan)"
 
     lines = [
         f"⚙️ *[WHEEL] {bd.tier()} — {ticker}*",
         f"Score: `{bd.total}/100`  |  {source}",
         "─────────────────────────",
-        f"🎰 IV Rank:  `{iv_str}`",
-        f"📋 OI tot:   `{oi_str}`",
+        f"📊 VRP:      `{vrp_str}`",
         f"💵 Prezzo:   `{'$%.2f' % price if price else 'N/A'}`",
         f"🏦 Cap:      `{_fmt_cap(cap)}`",
     ]
     if sector:
         lines.append(f"🏭 Settore:  `{sector}`")
+
+    # Miglior put candidata (wheel_scanner)
+    if ws and ws.best_put:
+        bp = ws.best_put
+        lines.append("─────────────────────────")
+        lines.append(f"🎯 *Miglior Put da vendere:*")
+        lines.append(f"   Strike:  `${bp.strike:.0f}`  |  Scad: `{bp.expiry}` ({bp.dte}gg)")
+        lines.append(f"   Premio:  `${bp.mid:.2f}`  |  Ann.Ret: `{bp.annualized_return:.1f}%`")
+        lines.append(f"   OI:      `{bp.open_interest:,}`  |  Spread: `{bp.spread_pct*100:.1f}%`")
+
+    # Earnings status
+    if ws:
+        earn_str = f"⚠️ {ws.next_earnings} — NELLA FINESTRA" if ws.earnings_in_window \
+                   else (f"✅ {ws.next_earnings}" if ws.next_earnings else "✅ Nessuno in finestra")
+        lines.append(f"📅 Earnings: `{earn_str}`")
+        if not ws.above_sma50:
+            lines.append("⚠️ `Sotto 50-SMA — trend ribassista`")
+
     lines.append("─────────────────────────")
     if bd.flags:
         for f in bd.flags:
