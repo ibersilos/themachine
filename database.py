@@ -91,6 +91,26 @@ def init_db() -> None:
         );
 
         CREATE INDEX IF NOT EXISTS idx_wheel_ticker ON wheel_cycles(ticker, year);
+
+        -- Capital tracking
+        CREATE TABLE IF NOT EXISTS capital (
+            id        INTEGER PRIMARY KEY CHECK (id = 1),
+            balance   REAL NOT NULL DEFAULT 0.0,   -- cash disponibile
+            seed      REAL NOT NULL DEFAULT 0.0,   -- capitale iniziale (mai cambia)
+            updated_at TEXT DEFAULT (datetime('now'))
+        );
+
+        INSERT OR IGNORE INTO capital (id, balance, seed) VALUES (1, 0.0, 0.0);
+
+        CREATE TABLE IF NOT EXISTS capital_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            event       TEXT NOT NULL,   -- seed | premium_in | premium_out | buy_shares | sell_shares | dividend | adjustment
+            amount      REAL NOT NULL,   -- positivo = entrata, negativo = uscita
+            ticker      TEXT,
+            note        TEXT,
+            balance_after REAL NOT NULL,
+            created_at  TEXT DEFAULT (datetime('now'))
+        );
         """)
         # Migrazione: aggiungi colonna pipeline se non esiste (DB pre-dual-pipeline)
         try:
@@ -232,3 +252,138 @@ def avg_pnl_per_cycle(ticker: str, year: int | None = None) -> float:
         (ticker, year),
     ).fetchone()
     return float(row[0]) if row and row[0] is not None else 0.0
+
+
+def get_open_cycles() -> list:
+    """Restituisce tutti i cicli wheel ancora aperti (non closed)."""
+    return _conn().execute(
+        "SELECT * FROM wheel_cycles WHERE phase != 'closed' ORDER BY opened_at DESC"
+    ).fetchall()
+
+
+def get_open_cycle(ticker: str):
+    """Restituisce il ciclo aperto più recente per un ticker, o None."""
+    return _conn().execute(
+        "SELECT * FROM wheel_cycles WHERE ticker=? AND phase != 'closed' "
+        "ORDER BY opened_at DESC LIMIT 1",
+        (ticker,),
+    ).fetchone()
+
+
+def upsert_position(ticker: str, cost_basis: float, shares: float,
+                    entry_date: str | None = None) -> None:
+    """Inserisce o aggiorna una posizione azionaria nel portafoglio."""
+    ed = entry_date or datetime.utcnow().strftime("%Y-%m-%d")
+    with tx() as conn:
+        conn.execute(
+            "INSERT INTO positions (ticker, entry_price, entry_date, shares) VALUES (?,?,?,?) "
+            "ON CONFLICT(ticker) DO UPDATE SET entry_price=excluded.entry_price, "
+            "shares=excluded.shares, entry_date=excluded.entry_date",
+            (ticker, cost_basis, ed, shares),
+        )
+
+
+def get_position(ticker: str):
+    return _conn().execute(
+        "SELECT * FROM positions WHERE ticker=?", (ticker,)
+    ).fetchone()
+
+
+def get_all_positions() -> list:
+    return _conn().execute("SELECT * FROM positions WHERE shares > 0").fetchall()
+
+
+def get_income_report(year: int | None = None, month: int | None = None) -> dict:
+    """Riepilogo income per anno/mese: premi chiusi + cicli aperti."""
+    now = datetime.utcnow()
+    year  = year  or now.year
+    month = month or now.month
+    conn  = _conn()
+
+    month_str = f"{year}-{month:02d}"
+    # Cicli chiusi nel mese
+    closed = conn.execute(
+        "SELECT ticker, pnl_realized, closed_at FROM wheel_cycles "
+        "WHERE phase='closed' AND strftime('%Y-%m', closed_at)=? "
+        "ORDER BY closed_at",
+        (month_str,),
+    ).fetchall()
+
+    # Cicli aperti (premi non ancora realizzati)
+    open_cyc = conn.execute(
+        "SELECT ticker, premium_received, premium_current, phase FROM wheel_cycles "
+        "WHERE phase != 'closed'"
+    ).fetchall()
+
+    total_realized  = sum(float(r["pnl_realized"] or 0) for r in closed)
+    total_unrealized = sum(
+        (float(r["premium_received"]) - float(r["premium_current"])) * 100
+        for r in open_cyc
+    )
+
+    # YTD
+    ytd = conn.execute(
+        "SELECT SUM(pnl_realized) FROM wheel_cycles "
+        "WHERE phase='closed' AND strftime('%Y', closed_at)=?",
+        (str(year),),
+    ).fetchone()[0] or 0.0
+
+    return {
+        "year": year, "month": month,
+        "closed_cycles": [dict(r) for r in closed],
+        "open_cycles":   [dict(r) for r in open_cyc],
+        "total_realized": total_realized,
+        "total_unrealized": total_unrealized,
+        "ytd_realized": float(ytd),
+        "n_closed": len(closed),
+    }
+
+
+# ── Capital helpers ───────────────────────────────────────────────────────────
+
+def get_capital() -> dict:
+    """Restituisce stato capitale: balance cash, seed, e log recente."""
+    conn = _conn()
+    row  = conn.execute("SELECT * FROM capital WHERE id=1").fetchone()
+    log  = conn.execute(
+        "SELECT * FROM capital_log ORDER BY id DESC LIMIT 20"
+    ).fetchall()
+    return {
+        "balance":  float(row["balance"]) if row else 0.0,
+        "seed":     float(row["seed"])    if row else 0.0,
+        "log":      [dict(r) for r in log],
+    }
+
+
+def seed_capital(amount: float) -> None:
+    """Imposta il capitale iniziale (solo prima volta — se seed già > 0 non fa nulla)."""
+    with tx() as conn:
+        row = conn.execute("SELECT seed FROM capital WHERE id=1").fetchone()
+        if row and float(row["seed"]) > 0:
+            return  # già seeded
+        conn.execute(
+            "UPDATE capital SET balance=?, seed=?, updated_at=datetime('now') WHERE id=1",
+            (amount, amount),
+        )
+        conn.execute(
+            "INSERT INTO capital_log (event, amount, note, balance_after) VALUES (?,?,?,?)",
+            ("seed", amount, f"Capitale iniziale ${amount:.2f}", amount),
+        )
+
+
+def log_capital(event: str, amount: float, ticker: str | None = None,
+                note: str = "") -> float:
+    """Aggiorna il balance e registra il movimento. Restituisce il nuovo balance."""
+    with tx() as conn:
+        row = conn.execute("SELECT balance FROM capital WHERE id=1").fetchone()
+        current = float(row["balance"]) if row else 0.0
+        new_bal = current + amount
+        conn.execute(
+            "UPDATE capital SET balance=?, updated_at=datetime('now') WHERE id=1",
+            (new_bal,),
+        )
+        conn.execute(
+            "INSERT INTO capital_log (event, amount, ticker, note, balance_after) VALUES (?,?,?,?,?)",
+            (event, amount, ticker, note, new_bal),
+        )
+        return new_bal

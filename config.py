@@ -46,7 +46,7 @@ PICK_CAP_MIN:   int   = _int("PICK_CAP_MIN",    50_000_000)   # $50M  — evita 
 PICK_CAP_MAX:   int   = _int("PICK_CAP_MAX",   500_000_000)   # $500M — small/mid cap
 PICK_VOL_MIN:   int   = _int("PICK_VOL_MIN",       200_000)   # volume medio giornaliero minimo
 PICK_PRICE_MIN: float = _float("PICK_PRICE_MIN",       2.0)   # prezzo minimo $
-PICK_PRICE_MAX: float = _float("PICK_PRICE_MAX",      25.0)   # prezzo massimo $
+PICK_PRICE_MAX: float = _float("PICK_PRICE_MAX",      20.0)   # prezzo massimo $
 
 # WHEEL_CANDIDATES (fonti: edgar_8k + serenity) — filtri base scoring_engine
 WHEEL_CAP_MIN:      int   = _int("WHEEL_CAP_MIN",   1_000_000_000)  # $1B — liquidità opzioni
@@ -88,6 +88,7 @@ IBKR_RECONNECT_DELAY: int  = _int("IBKR_RECONNECT_DELAY", 30)
 IBKR_MAX_RETRIES: int      = _int("IBKR_MAX_RETRIES", 10)
 # Intervallo tra sync di posizioni nel loop daemon (secondi)
 IBKR_SYNC_INTERVAL: int    = _int("IBKR_SYNC_INTERVAL", 60)
+IBKR_CP_PORT:      int    = _int("IBKR_CP_PORT", 5055)   # Client Portal Gateway
 # Se True: stop loss vengono loggati ma NON inviati a IBKR (test sicuro)
 IBKR_DRY_RUN: bool         = os.getenv("IBKR_DRY_RUN", "true").lower() in ("1", "true", "yes")
 

@@ -23,6 +23,7 @@ import serenity_validator
 import fundamentals
 import scoring_engine
 import wheel_scanner
+import wheel_daemon
 import telegram_bot
 import drive_export
 import api_server
@@ -156,9 +157,24 @@ def main() -> None:
     )
 
     telegram_bot.run_bot_in_thread()
+
+    # Seed capitale iniziale (idempotente: se già seeded non fa nulla)
+    db.seed_capital(1500.0)
+    logger.info("Capitale iniziale: $1500.00")
+
+    # Registra posizione Ford se non già presente (dati reali IBKR al 2026-07-09)
+    if not db.get_position("F"):
+        db.upsert_position("F", cost_basis=13.46, shares=100, entry_date="2026-07-09")
+        # Ford acquistata a $1346 — scala il cash disponibile
+        db.log_capital("buy_shares", -1346.0, "F", "Acquisto 100az Ford @ $13.46 (IBKR)")
+        logger.info("Posizione Ford (F) registrata: 100az @ $13.46")
+
+    wheel_daemon.start()
+
     telegram_bot.send_alert(
         "🟢 *the-machine online*\n"
-        "Sources: SEC 8-K · Form 4 · USAspending · Serenity · yfinance"
+        "Sources: SEC 8-K · Form 4 · USAspending · Serenity · yfinance\n"
+        "Wheel advisor attivo — usa /wheel /open /close /suggest /income /addpos"
     )
 
     threading.Thread(target=_scoring_worker, name="scorer", daemon=True).start()

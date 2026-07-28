@@ -1,0 +1,34 @@
+name: Wheel Daily Check
+
+on:
+  schedule:
+    - cron: '0 7 * * *'   # ogni giorno alle 8:00 CET (7 UTC)
+  workflow_dispatch:       # run manuale da GitHub UI
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Restore DB
+        uses: actions/cache@v4
+        with:
+          path: data/the_machine.db
+          key: the-machine-db-${{ github.run_id }}
+          restore-keys: the-machine-db-
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run wheel check
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          EDGAR_USER_AGENT:   ${{ secrets.EDGAR_USER_AGENT }}
+        run: python run_once.py --mode wheel

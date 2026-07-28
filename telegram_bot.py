@@ -268,6 +268,411 @@ def dispatch_signal(bd: ScoreBreakdown, signal: dict) -> None:
 
 # ── Bot command handlers ──────────────────────────────────────────────────────
 
+async def _cmd_wheel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /wheel — mostra posizioni aperte + azione Hogue consigliata per ciascuna.
+    Esegue un check immediato (come il daily check) e risponde in chat.
+    """
+    import wheel_daemon
+    open_cycles = db.get_open_cycles()
+    positions   = db.get_all_positions()
+
+    if not open_cycles and not positions:
+        await update.message.reply_text(
+            "Nessuna posizione tracciata.\n"
+            "Usa /open per registrare un ciclo o aggiungi azioni con /addpos.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # Header posizioni azionarie
+    lines = ["📊 *WHEEL DASHBOARD*\n"]
+    if positions:
+        lines.append("*Azioni in portafoglio:*")
+        for p in positions:
+            ticker = p["ticker"]
+            try:
+                from covered_call_optimizer import _get_ticker, _current_price
+                t = _get_ticker(ticker)
+                spot = _current_price(t)
+                cost = float(p["entry_price"])
+                shares = float(p["shares"])
+                gain = (spot - cost) * shares if spot else 0
+                gain_pct = (spot - cost) / cost * 100 if spot and cost else 0
+                lines.append(
+                    f"  `{ticker}` — {shares:.0f}az @ `${cost:.2f}` | "
+                    f"ora `${spot:.2f}` ({gain_pct:+.1f}%, `${gain:+.0f}`)"
+                )
+            except Exception:
+                lines.append(f"  `{ticker}` — {float(p['shares']):.0f}az @ `${float(p['entry_price']):.2f}`")
+
+    # Cicli aperti
+    if open_cycles:
+        lines.append("\n*Cicli aperti:*")
+        for c in open_cycles:
+            prem_r = float(c["premium_received"])
+            prem_c = float(c["premium_current"])
+            pct    = int((prem_r - prem_c) / prem_r * 100) if prem_r > 0 else 0
+            dte    = (db.date.fromisoformat(c["expiry"]) - db.date.today()).days if hasattr(db, 'date') else "?"
+            try:
+                from datetime import date as _date
+                dte = (_date.fromisoformat(c["expiry"]) - _date.today()).days
+            except Exception:
+                dte = "?"
+            lines.append(
+                f"  `{c['ticker']}` {c['phase'].upper()} `${float(c['strike']):.1f}` "
+                f"scad `{c['expiry']}` ({dte} DTE) — {pct}% catturato"
+            )
+    else:
+        lines.append("\n_Nessun ciclo aperto. Usa /open per registrarne uno._")
+
+    lines.append("\n_Eseguo check Hogue..._")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+    # Esegui check e invia advisory separati
+    for cycle in open_cycles:
+        try:
+            wheel_daemon._check_cycle(cycle)
+        except Exception as exc:
+            logger.error("_cmd_wheel check_cycle %s: %s", cycle["ticker"], exc)
+
+
+async def _cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /open <TICKER> <CC|CSP> <STRIKE> <SCADENZA> <PREMIO>
+    Es: /open F CC 15.0 2026-08-21 0.39
+
+    Registra un nuovo ciclo wheel aperto nel DB.
+    """
+    args = context.args
+    if not args or len(args) < 5:
+        await update.message.reply_text(
+            "Uso: `/open TICKER CC|CSP STRIKE SCADENZA PREMIO`\n"
+            "Es: `/open F CC 15.0 2026-08-21 0.39`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    try:
+        ticker  = args[0].upper()
+        phase   = args[1].lower()
+        if phase not in ("cc", "csp"):
+            raise ValueError("Fase deve essere CC o CSP")
+        phase_db = "covered_call" if phase == "cc" else "csp"
+        strike   = float(args[2])
+        expiry   = args[3]
+        premium  = float(args[4])
+        from datetime import date as _date
+        _date.fromisoformat(expiry)  # valida formato
+    except (ValueError, IndexError) as exc:
+        await update.message.reply_text(f"Errore nei parametri: {exc}", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    cycle_id = db.open_wheel_cycle(
+        ticker=ticker, strike=strike, expiry=expiry,
+        premium_received=premium, phase=phase_db,
+    )
+
+    pnl_per_contract = premium * 100
+    from datetime import date as _date
+    dte = (_date.fromisoformat(expiry) - _date.today()).days
+    ann_ret = (premium / strike) * (365 / max(dte, 1)) * 100
+
+    # Registra incasso premio sul capitale (il premio arriva subito in cassa)
+    new_bal = db.log_capital(
+        "premium_in", pnl_per_contract, ticker,
+        f"{phase.upper()} ${strike:.2f} scad {expiry} — premio incassato",
+    )
+
+    await update.message.reply_text(
+        f"✅ *Ciclo registrato* (ID {cycle_id})\n\n"
+        f"`{ticker}` {phase.upper()} strike `${strike:.2f}` scad `{expiry}` ({dte} DTE)\n"
+        f"Premio: `${premium:.2f}` → `${pnl_per_contract:.2f}` per contratto\n"
+        f"Ann. return stimato: `{ann_ret:.1f}%`\n"
+        f"Capitale cash: `${new_bal:.2f}`\n\n"
+        f"_Riceverai advisory automatici ogni mattina._\n"
+        f"Chiudi con `/close {ticker}`",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def _cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /close <TICKER> [PREMIO_CHIUSURA]
+    Es: /close F 0.19
+    Se non specifichi il premio di chiusura, usa il valore live da yfinance.
+    """
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Uso: `/close TICKER [PREMIO_CHIUSURA]`\n"
+            "Es: `/close F 0.19` (o `/close F` per usare prezzo live)",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    ticker   = args[0].upper()
+    cycle    = db.get_open_cycle(ticker)
+    if not cycle:
+        await update.message.reply_text(
+            f"Nessun ciclo aperto trovato per `{ticker}`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    # Premio di chiusura: da argomento o da yfinance
+    if len(args) >= 2:
+        try:
+            close_prem = float(args[1])
+        except ValueError:
+            await update.message.reply_text("Premio di chiusura non valido.", parse_mode=ParseMode.MARKDOWN)
+            return
+    else:
+        from covered_call_optimizer import _get_ticker, _fetch_live_premium
+        t   = _get_ticker(ticker)
+        opt = "call" if cycle["phase"] == "covered_call" else "put"
+        close_prem = _fetch_live_premium(t, float(cycle["strike"]), cycle["expiry"], opt)
+        if close_prem is None:
+            close_prem = 0.0
+            await update.message.reply_text(
+                f"Impossibile leggere il premio live — uso $0.00 (scaduta senza valore).",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+
+    prem_recv  = float(cycle["premium_received"])
+    pnl        = (prem_recv - close_prem) * 100
+    pct_cap    = int((prem_recv - close_prem) / prem_recv * 100) if prem_recv > 0 else 100
+    phase_lbl  = "CC" if cycle["phase"] == "covered_call" else "CSP"
+
+    notes = f"Chiuso manualmente via Telegram. Premio chiusura: ${close_prem:.2f}"
+    db.close_wheel_cycle(cycle["id"], pnl, notes)
+
+    # Se il costo di chiusura > 0, esci la differenza dal capitale
+    # (il premio era già entrato a /open; qui correggiamo per il buyback)
+    if close_prem > 0:
+        buyback_cost = close_prem * 100
+        new_bal = db.log_capital(
+            "premium_out", -buyback_cost, ticker,
+            f"{phase_lbl} buyback ${float(cycle['strike']):.2f} — costo riacquisto",
+        )
+    else:
+        cap = db.get_capital()
+        new_bal = cap["balance"]
+
+    # Determina prossima fase
+    next_phase = "CSP" if cycle["phase"] == "covered_call" else "CC"
+
+    await update.message.reply_text(
+        f"✅ *Ciclo chiuso — {ticker}*\n\n"
+        f"`{phase_lbl}` strike `${float(cycle['strike']):.2f}` scad `{cycle['expiry']}`\n"
+        f"Premio aperto: `${prem_recv:.2f}` | chiuso: `${close_prem:.2f}`\n"
+        f"Catturato: `{pct_cap}%` | PnL: `${pnl:+.2f}`\n"
+        f"Capitale cash: `${new_bal:.2f}`\n\n"
+        f"_Prossimo ciclo: apri una {next_phase} con /open {ticker} {next_phase} ..._",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def _cmd_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /suggest <TICKER> [CC|CSP]
+    Es: /suggest F CC   — analisi real-time + migliore CC da vendere adesso
+        /suggest F CSP  — migliore CSP da vendere
+        /suggest F      — deduce la fase dal ciclo aperto o dalle posizioni
+    """
+    import wheel_daemon
+    args = context.args
+    if not args:
+        await update.message.reply_text(
+            "Uso: `/suggest TICKER [CC|CSP]`\nEs: `/suggest F CC`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    ticker = args[0].upper()
+
+    # Deduce fase se non specificata
+    if len(args) >= 2:
+        phase = args[1].lower()
+        if phase not in ("cc", "csp"):
+            phase = "cc"
+    else:
+        cycle = db.get_open_cycle(ticker)
+        pos   = db.get_position(ticker)
+        if cycle:
+            phase = "csp" if cycle["phase"] == "covered_call" else "cc"
+        elif pos and float(pos["shares"]) > 0:
+            phase = "cc"
+        else:
+            phase = "cc"
+
+    await update.message.reply_text(
+        f"🔍 Analizzo {ticker} ({phase.upper()})...",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    result = wheel_daemon.suggest_next_cycle(ticker, phase)
+    msg    = wheel_daemon._fmt_suggest(result)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def _cmd_addpos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /addpos <TICKER> <AZIONI> <COSTO_MEDIO> [DATA]
+    Es: /addpos F 100 13.50 2024-06-01
+    Registra una posizione azionaria nel portafoglio.
+    """
+    args = context.args
+    if not args or len(args) < 3:
+        await update.message.reply_text(
+            "Uso: `/addpos TICKER AZIONI COSTO_MEDIO [DATA]`\n"
+            "Es: `/addpos F 100 13.50 2024-06-01`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    try:
+        ticker    = args[0].upper()
+        shares    = float(args[1])
+        cost      = float(args[2])
+        entry_dt  = args[3] if len(args) >= 4 else None
+    except (ValueError, IndexError) as exc:
+        await update.message.reply_text(f"Errore parametri: {exc}", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    db.upsert_position(ticker, cost, shares, entry_dt)
+
+    total_cost = cost * shares
+    await update.message.reply_text(
+        f"✅ *Posizione aggiunta — {ticker}*\n\n"
+        f"Azioni: `{shares:.0f}` | Costo medio: `${cost:.2f}`\n"
+        f"Capitale investito: `${total_cost:.2f}`\n\n"
+        f"Usa `/suggest {ticker} CC` per vedere la miglior covered call da vendere.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def _cmd_income(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /income [MESE] [ANNO]
+    Es: /income        — mese corrente
+        /income 6      — giugno anno corrente
+        /income 6 2026 — giugno 2026
+    Report income: premi realizzati + non realizzati + dividendi attesi.
+    """
+    import wheel_daemon
+    args = context.args
+    from datetime import datetime as _dt
+    now = _dt.utcnow()
+    month = int(args[0]) if args else now.month
+    year  = int(args[1]) if len(args) >= 2 else now.year
+
+    positions = db.get_all_positions()
+    msg = wheel_daemon._fmt_weekly_report(positions, year, month)
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def _cmd_capital(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /capital — stato del capitale: cash, investito in azioni, totale, crescita.
+    Opzionale: /capital log  — mostra ultimi movimenti.
+    """
+    import yfinance as yf
+    cap  = db.get_capital()
+    seed = cap["seed"]
+    cash = cap["balance"]
+
+    # Calcola valore azioni in portafoglio
+    positions = db.get_all_positions()
+    invested  = 0.0
+    pos_lines = []
+    for p in positions:
+        try:
+            price = yf.Ticker(p["ticker"]).fast_info.get("last_price") or float(p["entry_price"])
+        except Exception:
+            price = float(p["entry_price"])
+        val = price * float(p["shares"])
+        invested += val
+        cost_val  = float(p["entry_price"]) * float(p["shares"])
+        gain_pct  = (val - cost_val) / cost_val * 100 if cost_val else 0
+        pos_lines.append(
+            f"  `{p['ticker']}` {float(p['shares']):.0f}az "
+            f"@ `${price:.2f}` = `${val:.2f}` ({gain_pct:+.1f}%)"
+        )
+
+    total    = cash + invested
+    growth   = total - seed
+    growth_p = growth / seed * 100 if seed else 0
+
+    lines = [
+        "💼 *CAPITALE THE MACHINE*\n",
+        f"Seed iniziale:   `${seed:.2f}`",
+        f"Cash disponibile: `${cash:.2f}`",
+        f"Azioni in ptf:   `${invested:.2f}`",
+        "─────────────────────────",
+        f"Totale portafoglio: `${total:.2f}`",
+        f"Crescita:           `${growth:+.2f}` ({growth_p:+.1f}%)",
+    ]
+
+    if pos_lines:
+        lines.append("\n*Posizioni:*")
+        lines.extend(pos_lines)
+
+    # Mostra log se richiesto
+    args = context.args
+    if args and args[0].lower() == "log":
+        lines.append("\n*Ultimi movimenti:*")
+        for entry in cap["log"][:10]:
+            sign = "+" if entry["amount"] >= 0 else ""
+            tick = f" [{entry['ticker']}]" if entry.get("ticker") else ""
+            lines.append(
+                f"  `{entry['created_at'][:10]}` {entry['event']}{tick}: "
+                f"`{sign}${entry['amount']:.2f}` → `${entry['balance_after']:.2f}`"
+            )
+
+    lines.append(f"\n🕐 `{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}`")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def _cmd_dividend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /dividend <TICKER> <IMPORTO_PER_AZIONE>
+    Es: /dividend F 0.15   — registra dividendo Ford da $0.15/az
+    Aggiunge automaticamente (shares × importo) al capitale cash.
+    """
+    args = context.args
+    if not args or len(args) < 2:
+        await update.message.reply_text(
+            "Uso: `/dividend TICKER IMPORTO_PER_AZIONE`\n"
+            "Es: `/dividend F 0.15`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    try:
+        ticker = args[0].upper()
+        amount_per_share = float(args[1])
+    except ValueError:
+        await update.message.reply_text("Importo non valido.", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    pos = db.get_position(ticker)
+    shares = float(pos["shares"]) if pos else 1.0
+    total_div = amount_per_share * shares
+
+    new_bal = db.log_capital(
+        "dividend", total_div, ticker,
+        f"Dividendo ${amount_per_share:.4f}/az × {shares:.0f}az",
+    )
+
+    await update.message.reply_text(
+        f"✅ *Dividendo registrato — {ticker}*\n\n"
+        f"`${amount_per_share:.4f}` × `{shares:.0f}az` = `${total_div:.2f}`\n"
+        f"Capitale cash: `${new_bal:.2f}`",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
 async def _cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = db.get_risk_state()
     paused = db.is_paused()
@@ -345,6 +750,15 @@ def run_bot_in_thread() -> None:
         app.add_handler(CommandHandler("status",  _cmd_status))
         app.add_handler(CommandHandler("signals", _cmd_signals))
         app.add_handler(CommandHandler("risk",    _cmd_risk))
+        # Wheel advisory commands
+        app.add_handler(CommandHandler("wheel",    _cmd_wheel))
+        app.add_handler(CommandHandler("open",     _cmd_open))
+        app.add_handler(CommandHandler("close",    _cmd_close))
+        app.add_handler(CommandHandler("suggest",  _cmd_suggest))
+        app.add_handler(CommandHandler("addpos",   _cmd_addpos))
+        app.add_handler(CommandHandler("income",   _cmd_income))
+        app.add_handler(CommandHandler("capital",  _cmd_capital))
+        app.add_handler(CommandHandler("dividend", _cmd_dividend))
 
         logger.info("Telegram bot polling started")
         async with app:

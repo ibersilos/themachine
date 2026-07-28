@@ -165,6 +165,15 @@ def poll_awards() -> Generator[dict, None, None]:
         yield signal
 
 
+def run_once(on_signal) -> None:
+    """Single pass — per GitHub Actions / run_once.py."""
+    for sig in poll_awards():
+        try:
+            on_signal(sig)
+        except Exception as exc:
+            logger.error("on_signal error (usaspending): %s", exc)
+
+
 def run_forever(on_signal) -> None:
     logger.info("USAspending monitor started (interval=%ds)", config.USASPENDING_POLL_INTERVAL)
     while True:

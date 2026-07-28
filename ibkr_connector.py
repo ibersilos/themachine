@@ -1,553 +1,538 @@
 """
-ibkr_connector.py — Interactive Brokers connector via ib_insync.
+ibkr_connector.py — IBKR Client Portal Web API connector.
 
-Funzionalità:
-  - Connessione a IB Gateway o TWS con retry esponenziale
-  - Lettura posizioni opzioni aperte (short calls per wheel strategy)
-  - Sincronizzazione premium_current in wheel_cycles dal live feed IBKR
-  - Popolamento WheelPosition con dati live dal DB
-  - Ordine di stop loss automatico su stock se pnl_pct <= STOP_LOSS_PCT
-  - Tutto configurabile via .env
-  - Supporto DRY_RUN per test senza ordini reali
+Compatibile con IBKR Desktop tramite Client Portal Gateway (porta 5055).
+Usa REST HTTP invece di socket ib_insync — nessuna dipendenza da ib_insync.
 
-Dipendenza: ib_insync>=0.9.86
-  pip install ib_insync
+Setup (una-tantum):
+  1. Scarica Client Portal Gateway da:
+     https://www.interactivebrokers.com/en/trading/ib-api.php
+     → sezione "Client Portal API" → "Download Gateway"
+  2. Estrailo in una cartella, es: C:\\ibkr-gateway\\
+  3. Avvialo: cd C:\\ibkr-gateway && bin\\run.bat root\\conf.yaml
+  4. Apri https://localhost:5055 nel browser e fai login con le tue credenziali IBKR
+  5. Da quel momento il gateway è autenticato e risponde alle API
 
-Prerequisito: IB Gateway o TWS aperto e configurato per API locale.
+Porta default: 5055 (configurabile in .env come IBKR_CP_PORT=5055)
+
+Funzionalità Level 1 (advisory):
+  - Lettura account summary (NetLiq, cash, PnL)
+  - Lettura posizioni stock e opzioni live
+  - Sincronizzazione posizioni nel DB (positions + wheel_cycles)
+  - Keepalive automatico ogni 55 secondi (sessione CP scade senza tickle)
+  - Nessun ordine eseguito (DRY_RUN sempre attivo in Level 1)
+
+Funzionalità Level 2 (semi-auto, futura):
+  - Invio ordini previa approvazione Telegram
 """
-
 from __future__ import annotations
 
-import asyncio
 import logging
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date
 from typing import Callable, Optional
 
-# ib_insync/eventkit chiama get_event_loop() all'import — richiede loop esplicito in Python 3.12+
-try:
-    asyncio.get_event_loop()
-except RuntimeError:
-    asyncio.set_event_loop(asyncio.new_event_loop())
-
-from ib_insync import IB, Stock, StopOrder, util
+import httpx
 
 import config
 import database as db
-from covered_call_optimizer import WheelPosition
 
 logger = logging.getLogger(__name__)
-# util.patchAsyncio() rimosso: rompe asyncio.run() nel thread Telegram
-# (non serve: usiamo solo metodi sync di ib_insync, non async/await)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Dataclass risultato sync
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
+
+_CP_PORT  = int(getattr(config, "IBKR_CP_PORT",  5055))
+_BASE_URL = f"https://localhost:{_CP_PORT}/v1/api"
+_HEADERS  = {"Content-Type": "application/json"}
+_TIMEOUT  = 10
+
+
+# ── Dataclasses ───────────────────────────────────────────────────────────────
+
+@dataclass
+class AccountSummary:
+    account_id:    str
+    net_liq:       float = 0.0
+    total_cash:    float = 0.0
+    gross_pos_val: float = 0.0
+    unrealized_pnl: float = 0.0
+    currency:      str = "USD"
+
+
+@dataclass
+class IBKRPosition:
+    account_id:  str
+    ticker:      str
+    sec_type:    str          # STK | OPT | FUT
+    position:    float        # positivo = long, negativo = short
+    avg_cost:    float
+    market_val:  float = 0.0
+    unrealized:  float = 0.0
+    # opzioni
+    right:       str = ""     # C | P
+    strike:      float = 0.0
+    expiry:      str = ""     # YYYY-MM-DD
+    conid:       int = 0
+
 
 @dataclass
 class SyncResult:
-    """Risultato di un ciclo di sincronizzazione."""
-    synced:        list[WheelPosition]
-    stop_orders:   list[str]          # ticker che hanno triggerato stop loss
-    errors:        list[str]
-    timestamp:     float = 0.0
+    """Risultato di un ciclo di sincronizzazione (compatibile con main.py)."""
+    synced:      list = field(default_factory=list)
+    stop_orders: list = field(default_factory=list)
+    errors:      list = field(default_factory=list)
+    timestamp:   float = 0.0
+    connected:   bool = False
 
     def __post_init__(self):
-        self.timestamp = time.time()
+        if not self.timestamp:
+            self.timestamp = time.time()
 
     @property
     def ok(self) -> bool:
-        return len(self.errors) == 0
+        return self.connected and not self.errors
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  IBKRConnector
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Client Portal HTTP client ─────────────────────────────────────────────────
+
+class CPClient:
+    """
+    Client REST per IBKR Client Portal Gateway.
+    Gestisce SSL self-signed, keepalive, retry base.
+    """
+
+    def __init__(self, base: str = _BASE_URL):
+        self._base   = base
+        self._client = httpx.Client(
+            verify=False,       # certificato self-signed del gateway locale
+            timeout=_TIMEOUT,
+            headers=_HEADERS,
+        )
+        self._account_id: Optional[str] = None
+        self._authenticated = False
+
+    # ── HTTP helpers ──────────────────────────────────────────────────────────
+
+    def _get(self, path: str, **params) -> dict | list | None:
+        try:
+            r = self._client.get(f"{self._base}/{path}", params=params)
+            if r.status_code == 401:
+                self._authenticated = False
+                logger.warning("CP API: 401 Unauthorized — riloggati su https://localhost:%d", _CP_PORT)
+                return None
+            r.raise_for_status()
+            return r.json()
+        except httpx.ConnectError:
+            logger.error("CP Gateway non raggiungibile su %s — avvialo e riprova", self._base)
+            return None
+        except Exception as exc:
+            logger.warning("CP GET /%s: %s", path, exc)
+            return None
+
+    def _post(self, path: str, json: dict | None = None) -> dict | list | None:
+        try:
+            r = self._client.post(f"{self._base}/{path}", json=json or {})
+            if r.status_code == 401:
+                self._authenticated = False
+                return None
+            r.raise_for_status()
+            return r.json()
+        except httpx.ConnectError:
+            logger.error("CP Gateway non raggiungibile su %s", self._base)
+            return None
+        except Exception as exc:
+            logger.warning("CP POST /%s: %s", path, exc)
+            return None
+
+    # ── Auth / Keepalive ──────────────────────────────────────────────────────
+
+    def auth_status(self) -> bool:
+        """Restituisce True se la sessione è autenticata."""
+        data = self._get("iserver/auth/status")
+        if data and isinstance(data, dict):
+            authenticated = data.get("authenticated", False)
+            connected     = data.get("connected", False)
+            self._authenticated = bool(authenticated and connected)
+            logger.debug("CP auth: authenticated=%s connected=%s", authenticated, connected)
+            return self._authenticated
+        return False
+
+    def tickle(self) -> bool:
+        """
+        Keepalive: la sessione CP scade dopo ~60s senza attività.
+        Deve essere chiamato ogni ~55 secondi.
+        """
+        data = self._post("tickle")
+        return data is not None
+
+    def reauthenticate(self) -> bool:
+        """Tenta una re-autenticazione SSO senza aprire il browser."""
+        self._post("iserver/reauthenticate")
+        time.sleep(2)
+        return self.auth_status()
+
+    # ── Account ───────────────────────────────────────────────────────────────
+
+    def get_accounts(self) -> list[str]:
+        data = self._get("iserver/accounts")
+        if not data:
+            return []
+        if isinstance(data, dict):
+            acc = data.get("selectedAccount") or ""
+            all_acc = data.get("accounts") or []
+            return [acc] + [a for a in all_acc if a != acc]
+        if isinstance(data, list):
+            return data
+        return []
+
+    def get_account_id(self) -> Optional[str]:
+        if not self._account_id:
+            accs = self.get_accounts()
+            self._account_id = accs[0] if accs else None
+        return self._account_id
+
+    def get_account_summary(self) -> Optional[AccountSummary]:
+        acc = self.get_account_id()
+        if not acc:
+            return None
+        data = self._get(f"portfolio/{acc}/summary")
+        if not data or not isinstance(data, dict):
+            return None
+
+        def _val(key: str) -> float:
+            v = data.get(key, {})
+            if isinstance(v, dict):
+                return float(v.get("amount", 0) or 0)
+            return float(v or 0)
+
+        return AccountSummary(
+            account_id=acc,
+            net_liq=_val("netliquidation"),
+            total_cash=_val("totalcashvalue"),
+            gross_pos_val=_val("grosspositionvalue"),
+            unrealized_pnl=_val("unrealizedpnl"),
+            currency=data.get("currency", "USD"),
+        )
+
+    # ── Posizioni ─────────────────────────────────────────────────────────────
+
+    def get_positions(self, page: int = 0) -> list[IBKRPosition]:
+        acc = self.get_account_id()
+        if not acc:
+            return []
+        data = self._get(f"portfolio/{acc}/positions/{page}")
+        if not data or not isinstance(data, list):
+            return []
+
+        result = []
+        for p in data:
+            sec_type = p.get("assetClass", "").upper()
+            ticker   = p.get("ticker") or p.get("symbol") or ""
+            conid    = int(p.get("conid") or 0)
+            pos_size = float(p.get("position") or 0)
+            avg_cost = float(p.get("avgCost") or p.get("averageCost") or 0)
+            mkt_val  = float(p.get("mktValue") or 0)
+            unreal   = float(p.get("unrealizedPnl") or 0)
+
+            pos = IBKRPosition(
+                account_id=acc, ticker=ticker, sec_type=sec_type,
+                position=pos_size, avg_cost=avg_cost,
+                market_val=mkt_val, unrealized=unreal, conid=conid,
+            )
+
+            if sec_type == "OPT":
+                pos.right  = p.get("putOrCall", "").upper()[:1]    # C | P
+                pos.strike = float(p.get("strike") or 0)
+                raw_exp    = str(p.get("expiry") or p.get("lastTradingDayOrContractMonth") or "")
+                if len(raw_exp) == 8 and raw_exp.isdigit():
+                    pos.expiry = f"{raw_exp[:4]}-{raw_exp[4:6]}-{raw_exp[6:8]}"
+                else:
+                    pos.expiry = raw_exp
+
+            result.append(pos)
+
+        return result
+
+    def get_all_positions(self) -> list[IBKRPosition]:
+        """Legge tutte le pagine di posizioni (max 10 pagine)."""
+        all_pos = []
+        for page in range(10):
+            page_data = self.get_positions(page)
+            if not page_data:
+                break
+            all_pos.extend(page_data)
+            if len(page_data) < 100:
+                break
+        return all_pos
+
+    # ── Prezzi live ───────────────────────────────────────────────────────────
+
+    def get_market_snapshot(self, conids: list[int], fields: list[str] | None = None) -> dict:
+        """
+        Richiede snapshot di mercato per una lista di conId.
+        fields default: 31 (last), 84 (bid), 85 (ask), 86 (volume)
+        """
+        if not conids:
+            return {}
+        fields_str = ",".join(fields or ["31", "84", "85", "86"])
+        conids_str = ",".join(str(c) for c in conids)
+        data = self._get("iserver/marketdata/snapshot", conids=conids_str, fields=fields_str)
+        if not data or not isinstance(data, list):
+            return {}
+        result = {}
+        for item in data:
+            cid = item.get("conid")
+            if cid:
+                bid  = _parse_price(item.get("84"))
+                ask  = _parse_price(item.get("85"))
+                last = _parse_price(item.get("31"))
+                mid  = round((bid + ask) / 2, 4) if bid and ask else last
+                result[cid] = {"bid": bid, "ask": ask, "last": last, "mid": mid}
+        return result
+
+    def close(self):
+        self._client.close()
+
+
+def _parse_price(val) -> Optional[float]:
+    if val is None:
+        return None
+    try:
+        s = str(val).replace(",", "").strip()
+        return float(s) if s else None
+    except (ValueError, TypeError):
+        return None
+
+
+# ── IBKRConnector — facade principale ─────────────────────────────────────────
 
 class IBKRConnector:
     """
-    Gestisce la connessione a IB Gateway / TWS, la lettura delle posizioni
-    e l'invio di ordini di stop loss automatici.
-
-    Uso tipico:
-        connector = IBKRConnector()
-        connector.connect()
-        positions = connector.sync_wheel_positions()
-        connector.disconnect()
-
-    Oppure come daemon:
-        connector = start_ibkr_thread(on_sync=my_callback)
-        # ... lavora ...
-        connector.disconnect()
+    Facade per integrazione con main.py.
+    Gestisce keepalive, sync loop e interfaccia compatibile col codice esistente.
     """
 
-    def __init__(self) -> None:
-        self._ib = IB()
-        self._lock = threading.Lock()
-        self._stop_event = threading.Event()
-        self._connected = False
-        self._retry_count = 0
+    def __init__(self):
+        self._cp         = CPClient()
+        self._stop       = threading.Event()
+        self._lock       = threading.Lock()
+        self._connected  = False
+        self._keepalive_thread: Optional[threading.Thread] = None
 
-        # Registra handler disconnect
-        self._ib.disconnectedEvent += self._on_disconnected
-
-    # ── CONNESSIONE ────────────────────────────────────────────────────────────
+    # ── Connessione ───────────────────────────────────────────────────────────
 
     def connect(self) -> bool:
-        """
-        Connetti a IB Gateway / TWS.
-        Legge host, porta, clientId da config (variabili .env).
-        Restituisce True se la connessione ha avuto successo.
-        """
-        try:
-            self._ib.connect(
-                host=config.IBKR_HOST,
-                port=config.IBKR_PORT,
-                clientId=config.IBKR_CLIENT_ID,
-                timeout=config.IBKR_CONNECT_TIMEOUT,
-                readonly=False,
-            )
+        ok = self._cp.auth_status()
+        if ok:
             self._connected = True
-            self._retry_count = 0
-            logger.info(
-                "IBKR connesso: %s:%d (clientId=%d, account=%s)",
-                config.IBKR_HOST, config.IBKR_PORT,
-                config.IBKR_CLIENT_ID, config.IBKR_ACCOUNT or "default",
+            logger.info("IBKR Client Portal: autenticato (porta %d)", _CP_PORT)
+            self._start_keepalive()
+        else:
+            logger.warning(
+                "IBKR Client Portal non autenticato. "
+                "Avvia il gateway e fai login su https://localhost:%d", _CP_PORT
             )
-            return True
-        except Exception as exc:
-            logger.error("IBKR connect fallito: %s", exc)
             self._connected = False
-            return False
+        return ok
 
-    def _on_disconnected(self) -> None:
-        """Callback ib_insync: fired quando la connessione cade."""
+    def disconnect(self):
+        self._stop.set()
         self._connected = False
-        logger.warning("IBKR disconnesso — avvio reconnect loop")
-        t = threading.Thread(
-            target=self._reconnect_loop,
-            daemon=True,
-            name="ibkr-reconnect",
-        )
-        t.start()
-
-    def _reconnect_loop(self) -> None:
-        """
-        Tenta la riconnessione con backoff esponenziale.
-        Si ferma dopo IBKR_MAX_RETRIES tentativi o se stop_event è settato.
-        """
-        delay = config.IBKR_RECONNECT_DELAY
-        while (
-            not self._stop_event.is_set()
-            and self._retry_count < config.IBKR_MAX_RETRIES
-        ):
-            self._retry_count += 1
-            logger.info(
-                "Reconnect tentativo %d/%d in %ds...",
-                self._retry_count, config.IBKR_MAX_RETRIES, delay,
-            )
-            self._stop_event.wait(delay)
-            if self._stop_event.is_set():
-                return
-            if self.connect():
-                return
-            # Backoff esponenziale, cap a 5 minuti
-            delay = min(delay * 2, 300)
-
-        if self._retry_count >= config.IBKR_MAX_RETRIES:
-            logger.critical(
-                "IBKR: raggiunti %d tentativi. Intervento manuale necessario.",
-                config.IBKR_MAX_RETRIES,
-            )
-
-    def disconnect(self) -> None:
-        """Chiudi la connessione in modo pulito."""
-        self._stop_event.set()
-        if self._ib.isConnected():
-            self._ib.disconnect()
-        self._connected = False
-        logger.info("IBKR disconnesso (clean shutdown)")
+        self._cp.close()
+        logger.info("IBKR Client Portal: disconnesso")
 
     @property
     def is_connected(self) -> bool:
-        return self._connected and self._ib.isConnected()
+        return self._connected
 
-    # ── LETTURA POSIZIONI ──────────────────────────────────────────────────────
+    # ── Keepalive thread ──────────────────────────────────────────────────────
 
-    def get_option_positions(self) -> list[dict]:
-        """
-        Restituisce tutte le posizioni opzioni aperte sull'account.
-        Filtra per secType == 'OPT'.
-        """
-        if not self.is_connected:
-            logger.warning("get_option_positions: non connesso")
-            return []
+    def _start_keepalive(self):
+        if self._keepalive_thread and self._keepalive_thread.is_alive():
+            return
+        self._keepalive_thread = threading.Thread(
+            target=self._keepalive_loop, daemon=True, name="ibkr-keepalive"
+        )
+        self._keepalive_thread.start()
+        logger.info("IBKR keepalive thread avviato (ogni 55s)")
 
-        account = config.IBKR_ACCOUNT or ""
-        result = []
-        try:
-            for pos in self._ib.positions(account=account):
-                c = pos.contract
-                if c.secType != "OPT":
-                    continue
-                # Normalizza la data scadenza IBKR (YYYYMMDD) → YYYY-MM-DD
-                raw = c.lastTradeDateOrContractMonth or ""
-                if len(raw) == 8 and raw.isdigit():
-                    expiry_iso = f"{raw[:4]}-{raw[4:6]}-{raw[6:8]}"
-                else:
-                    expiry_iso = raw
+    def _keepalive_loop(self):
+        while not self._stop.wait(55):
+            try:
+                ok = self._cp.tickle()
+                if not ok:
+                    # Prova re-autenticazione silenziosa
+                    self._cp.reauthenticate()
+                logger.debug("IBKR keepalive: ok=%s", ok)
+            except Exception as exc:
+                logger.warning("Keepalive error: %s", exc)
 
-                result.append({
-                    "account":    pos.account,
-                    "ticker":     c.symbol,
-                    "right":      c.right,          # 'C' = call, 'P' = put
-                    "strike":     float(c.strike),
-                    "expiry":     expiry_iso,        # YYYY-MM-DD
-                    "position":   pos.position,      # negativo = short
-                    "avg_cost":   pos.avgCost,
-                    "contract":   c,
-                    "local_symbol": c.localSymbol,
-                })
-        except Exception as exc:
-            logger.error("get_option_positions error: %s", exc)
-
-        return result
-
-    def get_stock_positions(self) -> list[dict]:
-        """
-        Restituisce tutte le posizioni azionarie aperte.
-        Filtra per secType == 'STK'.
-        """
-        if not self.is_connected:
-            return []
-
-        account = config.IBKR_ACCOUNT or ""
-        result = []
-        try:
-            for pos in self._ib.positions(account=account):
-                c = pos.contract
-                if c.secType != "STK":
-                    continue
-                result.append({
-                    "ticker":   c.symbol,
-                    "position": pos.position,   # numero di azioni (positivo = long)
-                    "avg_cost": pos.avgCost,
-                    "contract": c,
-                })
-        except Exception as exc:
-            logger.error("get_stock_positions error: %s", exc)
-
-        return result
-
-    # ── PREZZI LIVE ────────────────────────────────────────────────────────────
-
-    def get_live_premium(self, contract) -> Optional[float]:
-        """
-        Richiede dati di mercato snapshot per un contratto opzione.
-        Restituisce il mid price (bid+ask)/2, fallback su last/close.
-        Restituisce None in caso di errore o dati non disponibili.
-        """
-        if not self.is_connected:
-            return None
-        try:
-            # qualify per riempire conId se mancante
-            self._ib.qualifyContracts(contract)
-            tickers = self._ib.reqTickers(contract)
-            if not tickers:
-                return None
-            tk = tickers[0]
-
-            bid, ask = tk.bid, tk.ask
-            if bid and ask and bid > 0 and ask > 0:
-                return round((bid + ask) / 2, 4)
-            if tk.last and tk.last > 0:
-                return round(tk.last, 4)
-            if tk.close and tk.close > 0:
-                return round(tk.close, 4)
-            return None
-        except Exception as exc:
-            label = getattr(contract, "localSymbol", str(contract))
-            logger.warning("get_live_premium(%s): %s", label, exc)
-            return None
-
-    def get_stock_price(self, ticker: str) -> Optional[float]:
-        """
-        Restituisce il prezzo corrente di un'azione via snapshot.
-        Mid price se bid/ask disponibili, altrimenti last/close.
-        """
-        if not self.is_connected:
-            return None
-        try:
-            contract = Stock(ticker, "SMART", "USD")
-            self._ib.qualifyContracts(contract)
-            tickers = self._ib.reqTickers(contract)
-            if not tickers:
-                return None
-            tk = tickers[0]
-
-            if tk.bid and tk.ask and tk.bid > 0 and tk.ask > 0:
-                return round((tk.bid + tk.ask) / 2, 4)
-            if tk.last and tk.last > 0:
-                return round(tk.last, 4)
-            if tk.close and tk.close > 0:
-                return round(tk.close, 4)
-            return None
-        except Exception as exc:
-            logger.warning("get_stock_price(%s): %s", ticker, exc)
-            return None
-
-    # ── SINCRONIZZAZIONE WHEEL POSITIONS ──────────────────────────────────────
+    # ── Sync principale ───────────────────────────────────────────────────────
 
     def sync_wheel_positions(self) -> SyncResult:
         """
-        Pipeline principale:
-          1. Legge short calls da IBKR
-          2. Trova il ciclo wheel corrispondente nel DB
-          3. Richiede premium live, aggiorna DB
-          4. Costruisce WheelPosition con dati freschi
-          5. Controlla stop loss su ogni stock sottostante
+        Legge posizioni da IBKR Client Portal e sincronizza nel DB.
 
-        Restituisce un SyncResult con la lista di WheelPosition aggiornate.
+        Stock positions → aggiorna tabella positions
+        Short call/put  → aggiorna premium_current in wheel_cycles
         """
-        synced: list[WheelPosition] = []
-        stop_orders: list[str] = []
-        errors: list[str] = []
+        result = SyncResult(connected=self._connected)
 
-        if not self.is_connected:
-            errors.append("Non connesso a IBKR")
-            return SyncResult(synced, stop_orders, errors)
+        if not self._connected:
+            result.errors.append("Non connesso — avvia Client Portal Gateway")
+            return result
 
-        # 1. Posizioni opzioni da IBKR (solo short calls per wheel)
-        all_opts = self.get_option_positions()
-        short_calls = [
-            p for p in all_opts
-            if p["right"] == "C" and p["position"] < 0
-        ]
+        try:
+            positions = self._cp.get_all_positions()
+        except Exception as exc:
+            result.errors.append(f"get_all_positions: {exc}")
+            return result
 
-        if not short_calls:
-            logger.debug("sync_wheel_positions: nessuna short call trovata su IBKR")
-            return SyncResult(synced, stop_orders, errors)
+        stocks    = [p for p in positions if p.sec_type == "STK"]
+        options   = [p for p in positions if p.sec_type == "OPT"]
+        short_opt = [p for p in options if p.position < 0]
 
-        # Precarica posizioni stock per lookup entry_price e shares
-        stock_map = {p["ticker"]: p for p in self.get_stock_positions()}
-
-        for opt in short_calls:
-            ticker  = opt["ticker"]
-            strike  = opt["strike"]
-            expiry  = opt["expiry"]
-
+        # ── 1. Sincronizza posizioni azionarie nel DB ─────────────────────────
+        for s in stocks:
             try:
-                # 2. Trova ciclo aperto nel DB corrispondente
-                db_row = self._find_db_cycle(ticker, strike, expiry)
-                if db_row is None:
-                    logger.debug(
-                        "Nessun ciclo DB per %s $%.2f %s — salto", ticker, strike, expiry
-                    )
+                existing = db.get_position(s.ticker)
+                if not existing:
+                    db.upsert_position(s.ticker, s.avg_cost, s.position)
+                    logger.info("Posizione IBKR importata: %s %.0faz @ $%.2f",
+                                s.ticker, s.position, s.avg_cost)
+                else:
+                    # aggiorna solo shares (il costo medio è quello che ha inserito l'utente)
+                    with db.tx() as conn:
+                        conn.execute(
+                            "UPDATE positions SET shares=? WHERE ticker=?",
+                            (s.position, s.ticker),
+                        )
+            except Exception as exc:
+                result.errors.append(f"sync stock {s.ticker}: {exc}")
+
+        # ── 2. Aggiorna premium_current dalle opzioni live ───────────────────
+        if short_opt:
+            conids = [p.conid for p in short_opt if p.conid]
+            snap   = self._cp.get_market_snapshot(conids) if conids else {}
+
+        for opt in short_opt:
+            try:
+                ticker = opt.ticker
+                strike = opt.strike
+                expiry = opt.expiry
+                phase  = "covered_call" if opt.right == "C" else "csp"
+
+                # Trova ciclo nel DB
+                cycle = self._find_db_cycle(ticker, strike, expiry, phase)
+                if cycle is None:
+                    # Ciclo non presente nel DB → crea automaticamente
+                    logger.info("Opzione IBKR non in DB: %s %s $%.1f %s — registro",
+                                ticker, opt.right, strike, expiry)
+                    prem = snap.get(opt.conid, {}).get("mid") or abs(opt.avg_cost)
+                    db.open_wheel_cycle(ticker, strike, expiry, prem, phase)
+                    result.synced.append(f"{ticker} {opt.right} ${strike} {expiry} (nuovo)")
                     continue
 
-                cycle_id = db_row["id"]
+                # Aggiorna premium live
+                mid = snap.get(opt.conid, {}).get("mid")
+                if mid is not None and mid > 0:
+                    db.update_wheel_premium(cycle["id"], mid)
+                    logger.info("Premium aggiornato: %s $%.1f %s → $%.3f",
+                                ticker, strike, expiry, mid)
 
-                # 3. Premium live da IBKR
-                live_premium = self.get_live_premium(opt["contract"])
-                if live_premium is not None:
-                    db.update_wheel_premium(cycle_id, live_premium)
-                    logger.info(
-                        "Premium aggiornato: %s %s $%.2f → $%.4f",
-                        ticker, expiry, strike, live_premium,
-                    )
-                else:
-                    logger.warning(
-                        "Premium non disponibile per %s %s $%.2f — uso valore DB",
-                        ticker, expiry, strike,
-                    )
-                    live_premium = float(db_row["premium_current"] or 0)
+                result.synced.append(f"{ticker} {opt.right} ${strike} {expiry}")
 
-                # 4. entry_price da tabella positions, fallback su strike
-                entry_price = self._get_entry_price(ticker, strike)
-
-                # 5. Costruisce WheelPosition
-                wp = WheelPosition(
-                    cycle_id=cycle_id,
-                    ticker=ticker,
-                    strike=strike,
-                    expiry=_parse_date(expiry),
-                    premium_received=float(db_row["premium_received"] or 0),
-                    premium_current=live_premium,
-                    entry_price=entry_price,
-                    roll_count=int(db_row["roll_count"] or 0),
-                    phase=db_row["phase"],
-                )
-                synced.append(wp)
-
-                # 6. Stop loss su stock sottostante
-                stock_info = stock_map.get(ticker)
-                if stock_info and entry_price > 0:
-                    current_price = self.get_stock_price(ticker)
-                    if current_price is not None:
-                        pnl_pct = (current_price - entry_price) / entry_price
+                # Stop loss check
+                stock = next((s for s in stocks if s.ticker == ticker), None)
+                if stock:
+                    entry_row = db.get_position(ticker)
+                    entry_price = float(entry_row["entry_price"]) if entry_row else opt.avg_cost
+                    stock_mid = snap.get(stock.conid, {}).get("mid") or 0
+                    if stock_mid and entry_price:
+                        pnl_pct = (stock_mid - entry_price) / entry_price
                         if pnl_pct <= -config.STOP_LOSS_PCT:
-                            placed = self._execute_stop_loss(
-                                ticker=ticker,
-                                shares=int(stock_info["position"]),
-                                entry_price=entry_price,
-                                current_price=current_price,
-                                pnl_pct=pnl_pct,
-                            )
-                            if placed:
-                                stop_orders.append(ticker)
+                            logger.warning("STOP LOSS: %s @ $%.2f (entry $%.2f, %.1f%%)",
+                                           ticker, stock_mid, entry_price, pnl_pct * 100)
+                            result.stop_orders.append(ticker)
+                            # Level 1: alert solo via Telegram (nessun ordine automatico)
+                            from telegram_bot import check_stop_loss
+                            check_stop_loss(ticker, entry_price, stock_mid)
 
             except Exception as exc:
-                msg = f"{ticker}: {exc}"
-                logger.error("sync_wheel_positions — errore su %s", msg, exc_info=True)
-                errors.append(msg)
+                result.errors.append(f"sync opt {opt.ticker}: {exc}")
 
         logger.info(
-            "sync_wheel_positions: %d posizioni sincronizzate, %d stop loss, %d errori",
-            len(synced), len(stop_orders), len(errors),
+            "IBKR sync: %d posizioni, %d stop, %d errori",
+            len(result.synced), len(result.stop_orders), len(result.errors),
         )
-        return SyncResult(synced, stop_orders, errors)
+        return result
 
-    def _find_db_cycle(self, ticker: str, strike: float, expiry: str):
-        """
-        Cerca in wheel_cycles un ciclo aperto con ticker+strike+expiry corrispondenti.
-        Restituisce la riga DB o None.
-        """
+    def _find_db_cycle(self, ticker: str, strike: float, expiry: str, phase: str):
         rows = db.get_wheel_cycles_year(ticker)
         for row in rows:
             if row["phase"] == "closed":
                 continue
-            row_strike = float(row["strike"] or 0)
-            if abs(row_strike - strike) > 0.01:
+            if abs(float(row["strike"] or 0) - strike) > 0.01:
                 continue
             if row["expiry"] == expiry:
                 return row
+            # Tolleranza scadenza ±1 giorno (normalizzazione data IBKR)
+            try:
+                db_d  = date.fromisoformat(row["expiry"])
+                opt_d = date.fromisoformat(expiry)
+                if abs((db_d - opt_d).days) <= 1:
+                    return row
+            except Exception:
+                pass
         return None
 
-    def _get_entry_price(self, ticker: str, fallback: float) -> float:
-        """Legge entry_price dalla tabella positions; ritorna fallback se non trovato."""
-        try:
-            row = db._conn().execute(
-                "SELECT entry_price FROM positions WHERE ticker=?", (ticker,)
-            ).fetchone()
-            if row and row["entry_price"]:
-                return float(row["entry_price"])
-        except Exception:
-            pass
-        return fallback
-
-    # ── STOP LOSS ──────────────────────────────────────────────────────────────
-
-    def _execute_stop_loss(
-        self,
-        ticker: str,
-        shares: int,
-        entry_price: float,
-        current_price: float,
-        pnl_pct: float,
-    ) -> bool:
-        """
-        Emette un ordine SELL STOP sul titolo azionario.
-        In modalità DRY_RUN logga senza inviare.
-        Il stop price è current_price (esegui subito a mercato-stop).
-        """
-        logger.warning(
-            "STOP LOSS TRIGGERED: %s @ $%.2f (entry $%.2f, P&L %.1f%%)",
-            ticker, current_price, entry_price, pnl_pct * 100,
-        )
-
-        if config.IBKR_DRY_RUN:
-            logger.info(
-                "[DRY RUN] Ordine non inviato: SELL %d %s @ STOP $%.2f",
-                shares, ticker, current_price,
-            )
-            return True
-
-        return self.place_stop_order(ticker, shares, current_price)
-
-    def place_stop_order(self, ticker: str, shares: int, stop_price: float) -> bool:
-        """
-        Invia un ordine SELL STOP su SMART exchange per `shares` azioni di `ticker`.
-        Restituisce True se l'ordine è stato accettato da IBKR.
-        """
-        if not self.is_connected:
-            logger.error("place_stop_order: non connesso")
-            return False
-        if shares <= 0:
-            logger.error("place_stop_order(%s): shares=%d non valido", ticker, shares)
-            return False
-
-        try:
-            contract = Stock(ticker, "SMART", "USD")
-            self._ib.qualifyContracts(contract)
-            order = StopOrder("SELL", shares, stop_price)
-            trade = self._ib.placeOrder(contract, order)
-            logger.info(
-                "Ordine stop inviato: SELL %d %s @ STOP $%.2f — orderId=%s",
-                shares, ticker, stop_price, trade.order.orderId,
-            )
-            return True
-        except Exception as exc:
-            logger.error("place_stop_order(%s) fallito: %s", ticker, exc)
-            return False
-
-    # ── SYNC LOOP (daemon thread) ──────────────────────────────────────────────
+    # ── Sync loop daemon ──────────────────────────────────────────────────────
 
     def run_sync_loop(
         self,
         on_sync: Callable[[SyncResult], None] | None = None,
         interval: int | None = None,
     ) -> None:
-        """
-        Loop bloccante che esegue sync_wheel_positions ogni `interval` secondi.
-        Progettato per girare in un daemon thread.
+        secs = interval or config.IBKR_SYNC_INTERVAL
+        logger.info("IBKR sync loop avviato (ogni %ds)", secs)
 
-        Args:
-            on_sync:  callback chiamata con SyncResult dopo ogni ciclo
-            interval: secondi tra un sync e il successivo (default: IBKR_SYNC_INTERVAL)
-        """
-        secs = interval if interval is not None else config.IBKR_SYNC_INTERVAL
-        logger.info("IBKR sync loop avviato (interval=%ds)", secs)
-
-        while not self._stop_event.is_set():
-            if not self.is_connected:
-                logger.debug("Sync loop: non connesso, attendo 10s...")
-                self._stop_event.wait(10)
+        while not self._stop.wait(secs):
+            if not self._connected:
+                # Tenta riconnessione silenziosa
+                self.connect()
                 continue
-
             result = self.sync_wheel_positions()
-
             if on_sync:
                 try:
                     on_sync(result)
                 except Exception as exc:
-                    logger.error("on_sync callback error: %s", exc)
-
-            self._stop_event.wait(secs)
+                    logger.error("on_sync callback: %s", exc)
 
         logger.info("IBKR sync loop terminato")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-#  Factory helper
-# ─────────────────────────────────────────────────────────────────────────────
+# ── Factory ───────────────────────────────────────────────────────────────────
 
 def start_ibkr_thread(
     on_sync: Callable[[SyncResult], None] | None = None,
 ) -> IBKRConnector:
     """
-    Crea un IBKRConnector, connette e avvia il sync loop in un daemon thread.
-    Restituisce il connector (chiama .disconnect() per fermare).
-
-    Se la connessione iniziale fallisce il connector tenterà il retry in background.
+    Crea connector, tenta connessione, avvia sync loop daemon.
+    Se il gateway non è attivo logga un warning e continua senza bloccare.
     """
     connector = IBKRConnector()
 
     if not connector.connect():
         logger.warning(
-            "Connessione IBKR iniziale fallita — retry automatico in background attivo"
+            "IBKR Client Portal Gateway non disponibile.\n"
+            "  → Scaricalo da: https://www.interactivebrokers.com/en/trading/ib-api.php\n"
+            "  → Avvialo: bin/run.bat root/conf.yaml\n"
+            "  → Fai login su https://localhost:%d\n"
+            "Il bot funziona normalmente; le posizioni IBKR non vengono sincronizzate.",
+            _CP_PORT,
         )
 
     t = threading.Thread(
@@ -557,18 +542,4 @@ def start_ibkr_thread(
         name="ibkr-sync",
     )
     t.start()
-    logger.info("IBKR sync thread avviato (daemon=True)")
     return connector
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-#  Utility
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _parse_date(s: str) -> date:
-    """Converte stringa YYYY-MM-DD in date. Fallback a today se non parsabile."""
-    try:
-        return date.fromisoformat(s)
-    except (ValueError, TypeError):
-        logger.warning("_parse_date: formato non valido '%s' — uso today", s)
-        return date.today()

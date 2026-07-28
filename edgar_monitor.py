@@ -214,6 +214,15 @@ def poll_form4() -> Generator[dict, None, None]:
         yield signal
 
 
+def run_once(on_signal) -> None:
+    """Single pass — per GitHub Actions / run_once.py."""
+    for sig in poll_8k():
+        try:
+            on_signal(sig)
+        except Exception as exc:
+            logger.error("on_signal error (8k): %s", exc)
+
+
 def run_forever(on_signal) -> None:
     """
     Blocking loop: polls 8-K and Form-4 feeds, calls on_signal(dict) for each.

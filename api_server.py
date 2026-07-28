@@ -209,10 +209,12 @@ def get_positions() -> dict:
             "SELECT ticker, entry_price, entry_date, shares FROM positions"
         ).fetchall()
 
+        import fundamentals
         result = []
         for sr in stock_rows:
             ticker = sr["ticker"]
             entry  = float(sr["entry_price"] or 0)
+            current_price = fundamentals.current_price(ticker) or entry
 
             # Ciclo wheel più recente non chiuso
             cycle = conn.execute(
@@ -223,11 +225,14 @@ def get_positions() -> dict:
             ).fetchone()
 
             pos: dict[str, Any] = {
-                "ticker":       ticker,
-                "entry_price":  entry,
-                "entry_date":   sr["entry_date"],
-                "shares":       float(sr["shares"] or 0),
-                "cycle":        None,
+                "ticker":        ticker,
+                "entry_price":   entry,
+                "current_price": round(current_price, 4),
+                "pnl":           round((current_price - entry) * float(sr["shares"] or 0), 2),
+                "pnl_pct":       round((current_price - entry) / entry * 100, 2) if entry else 0,
+                "entry_date":    sr["entry_date"],
+                "shares":        float(sr["shares"] or 0),
+                "cycle":         None,
             }
 
             if cycle:
@@ -339,6 +344,57 @@ def get_wheel(year: int | None = Query(default=None)) -> dict:
         }
     except Exception as exc:
         logger.error("/api/wheel error: %s", exc)
+        raise HTTPException(500, str(exc))
+
+
+# ── /api/capital ─────────────────────────────────────────────────────────────
+
+@app.get("/api/capital")
+def get_capital() -> dict:
+    """Stato capitale: cash, investito (prezzi live), totale, crescita."""
+    try:
+        import fundamentals
+        cap = db.get_capital()
+        positions = db._conn().execute(
+            "SELECT ticker, entry_price, shares FROM positions WHERE shares > 0"
+        ).fetchall()
+
+        invested = 0.0
+        pos_detail = []
+        for p in positions:
+            ticker = p["ticker"]
+            shares = float(p["shares"])
+            cost   = float(p["entry_price"])
+            price  = fundamentals.current_price(ticker) or cost
+            val    = price * shares
+            invested += val
+            pos_detail.append({
+                "ticker":        ticker,
+                "shares":        shares,
+                "cost_basis":    cost,
+                "current_price": round(price, 4),
+                "market_value":  round(val, 2),
+                "pnl":           round((price - cost) * shares, 2),
+                "pnl_pct":       round((price - cost) / cost * 100, 2) if cost else 0,
+            })
+
+        cash  = float(cap["balance"])
+        seed  = float(cap["seed"])
+        total = round(cash + invested, 2)
+        growth = round(total - seed, 2)
+
+        return {
+            "ok":       True,
+            "seed":     seed,
+            "cash":     round(cash, 2),
+            "invested": round(invested, 2),
+            "total":    total,
+            "growth":   growth,
+            "growth_pct": round(growth / seed * 100, 2) if seed else 0,
+            "positions": pos_detail,
+        }
+    except Exception as exc:
+        logger.error("/api/capital error: %s", exc)
         raise HTTPException(500, str(exc))
 
 
