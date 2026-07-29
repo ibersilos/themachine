@@ -67,6 +67,13 @@ def _filter_stock_picking(signal: dict, ticker: str | None) -> bool:
     """Ritorna True (= scartare) se il segnale non soddisfa i criteri PICK."""
     t = ticker or "—"
 
+    if not ticker:
+        # Nessun ticker risolto (spesso un emittente non quotato — fondo
+        # privato, BDC non-traded, ecc.): non è acquistabile sul mercato,
+        # quindi non è un pick, a prescindere dal punteggio.
+        logger.info("[PICK] scartata: nessun ticker risolto (titolo non quotato?)")
+        return True
+
     cap = signal.get("market_cap")
     if cap is not None:
         if cap < config.PICK_CAP_MIN:
@@ -97,6 +104,10 @@ def _filter_stock_picking(signal: dict, ticker: str | None) -> bool:
 def _filter_wheel_candidate(signal: dict, ticker: str | None) -> bool:
     """Ritorna True (= scartare) se il segnale non soddisfa i criteri WHEEL."""
     t = ticker or "—"
+
+    if not ticker:
+        logger.info("[WHEEL] scartata: nessun ticker risolto (titolo non quotato?)")
+        return True
 
     # Market cap minimo $1B (liquidità opzioni garantita)
     cap = signal.get("market_cap")

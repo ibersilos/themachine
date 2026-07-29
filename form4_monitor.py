@@ -61,7 +61,25 @@ def _parse_form4_xml(xml_text: str) -> dict:
         "is_high_conviction":    False,
         "ownership_post":        None,
         "transaction_date":      None,
+        "issuer_ticker":         None,
+        "issuer_cik":            None,
+        "issuer_name":           None,
     }
+
+    # Issuer identity — authoritative source for ticker resolution.
+    # The RSS entry URL's CIK can belong to ANY party on a jointly-filed
+    # Form 4 (issuer or any reporting owner), so it must not be trusted
+    # for ticker lookup. The <issuer> block inside the XML itself is
+    # the same regardless of which party's URL was used to fetch it.
+    issuer = soup.find("issuer")
+    if issuer:
+        cik_tag = issuer.find("issuerCik")
+        symbol_tag = issuer.find("issuerTradingSymbol")
+        name_tag = issuer.find("issuerName")
+        result["issuer_cik"] = cik_tag.get_text(strip=True) if cik_tag else None
+        symbol = symbol_tag.get_text(strip=True) if symbol_tag else None
+        result["issuer_ticker"] = symbol.upper() if symbol else None
+        result["issuer_name"] = name_tag.get_text(strip=True) if name_tag else None
 
     # Insider identity
     rp = soup.find("reportingOwner")
@@ -143,6 +161,12 @@ def enrich_form4_signal(raw_signal: dict) -> dict:
     Takes a raw Form-4 signal from edgar_monitor and enriches it
     with parsed transaction data from the actual XML filing.
     Returns the enriched signal (mutated in place + returned).
+
+    Always writes the enriched payload back to the DB row (if the raw
+    signal carries a _db_id) regardless of purchase/sale outcome, so the
+    persisted record always reflects what scoring actually used — the
+    prior behaviour left the DB row frozen at its pre-enrichment stub,
+    making backtesting impossible even for signals that did score.
     """
     url = raw_signal.get("filing_url")
     if not url:
@@ -161,6 +185,22 @@ def enrich_form4_signal(raw_signal: dict) -> dict:
         xml_text = _get(xml_url).text
         parsed = _parse_form4_xml(xml_text)
         raw_signal.update(parsed)
+
+        # Issuer ticker from the XML itself is authoritative — prefer it
+        # over whatever the RSS-entry-URL-based guess produced upstream,
+        # since that guess can resolve to any party on a joint filing.
+        if parsed.get("issuer_ticker"):
+            raw_signal["ticker"] = parsed["issuer_ticker"]
+
+        sig_id = raw_signal.get("_db_id")
+        if sig_id:
+            from database import tx as db_tx
+            with db_tx() as conn:
+                conn.execute(
+                    "UPDATE signals SET payload=?, ticker=? WHERE id=?",
+                    (json.dumps({k: v for k, v in raw_signal.items() if not k.startswith("_")}),
+                     raw_signal.get("ticker"), sig_id),
+                )
     except Exception as exc:
         logger.warning("Form 4 XML parse failed for %s: %s", url, exc)
 

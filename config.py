@@ -40,6 +40,12 @@ DRAWDOWN_PAUSE_DAYS: int    = _int("DRAWDOWN_PAUSE_DAYS", 30)
 MIN_ALERT_SCORE: int      = _int("MIN_ALERT_SCORE", 20)
 STRONG_BUY_THRESHOLD: int = _int("STRONG_BUY_THRESHOLD", 50)
 
+# Alert dispatch — interruttore per pipeline. Default: solo stock-picking
+# (small/mid cap, più drift post-notizia). WHEEL disattivato finché il
+# capitale dedicato al wheel non giustifica nuove posizioni — i segnali
+# restano comunque salvati nel DB, solo non generano alert Telegram.
+WHEEL_ALERTS_ENABLED: bool = os.getenv("WHEEL_ALERTS_ENABLED", "false").lower() in ("1", "true", "yes")
+
 # ── Dual pipeline filters ─────────────────────────────────────────────────────
 # STOCK_PICKING (fonti: form4 + usaspending)
 PICK_CAP_MIN:   int   = _int("PICK_CAP_MIN",    50_000_000)   # $50M  — evita micro cap

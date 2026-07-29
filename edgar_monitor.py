@@ -25,6 +25,12 @@ _RSS_FORM4   = f"{_EDGAR_BASE}/cgi-bin/browse-edgar?action=getcurrent&type=4&dat
 
 _SEEN_IDS: set[str] = set()
 
+# A jointly-filed Form 4 (issuer + multiple reporting owners) shows up as
+# one RSS entry per party, each under a different party's CIK path but
+# pointing at the SAME accession — dedup on that so one filing = one signal.
+_SEEN_FORM4_ACCESSIONS: set[str] = set()
+_ACCESSION_RE = re.compile(r"/edgar/data/\d+/(\d+)")
+
 _HEADERS = {
     "User-Agent": config.EDGAR_USER_AGENT,
     "Accept-Encoding": "gzip, deflate",
@@ -192,11 +198,22 @@ def poll_form4() -> Generator[dict, None, None]:
                 logger.debug("Form-4 poll: skipping non-Form-4 entry: %s", title[:80])
                 continue
 
-        ticker = _parse_ticker_from_filing(entry["url"]) if entry["url"] else None
+        accession = _ACCESSION_RE.search(entry["url"]).group(1) if entry["url"] and _ACCESSION_RE.search(entry["url"]) else None
+        if accession:
+            if accession in _SEEN_FORM4_ACCESSIONS:
+                logger.debug("Form-4 poll: skipping duplicate accession %s (%s)", accession, title[:60])
+                continue
+            _SEEN_FORM4_ACCESSIONS.add(accession)
 
+        # Ticker is intentionally left unresolved here: the RSS entry URL's
+        # CIK can belong to any party on a joint filing (issuer or a
+        # reporting owner), so a URL-based guess is unreliable. The
+        # downstream XML enrichment (form4_monitor) reads the <issuer>
+        # block directly, which is authoritative regardless of which
+        # party's URL variant we happened to dedup on.
         signal = {
             "source":       "form4",
-            "ticker":       ticker,
+            "ticker":       None,
             "filing_title": entry["title"],
             "filing_url":   entry["url"],
             "cik":          entry["cik"],
@@ -221,6 +238,12 @@ def run_once(on_signal) -> None:
             on_signal(sig)
         except Exception as exc:
             logger.error("on_signal error (8k): %s", exc)
+
+    for sig in poll_form4():
+        try:
+            on_signal(sig)
+        except Exception as exc:
+            logger.error("on_signal error (form4): %s", exc)
 
 
 def run_forever(on_signal) -> None:

@@ -36,6 +36,7 @@ def run_wheel() -> None:
 
 
 def run_signals() -> None:
+    import config
     import database as db
     import edgar_monitor
     import form4_monitor
@@ -80,6 +81,8 @@ def run_signals() -> None:
                 continue
             bd = scoring_engine.score_signal(enriched)
             if bd.filtered:
+                continue
+            if bd.pipeline == "wheel_candidate" and not config.WHEEL_ALERTS_ENABLED:
                 continue
             enriched["score"] = bd.total
             enriched["tier"]  = bd.tier()

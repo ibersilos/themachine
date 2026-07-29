@@ -117,6 +117,8 @@ def _scoring_worker() -> None:
             bd = scoring_engine.score_signal(enriched)
             if bd.filtered:
                 continue  # market cap fuori range — nessun alert
+            if bd.pipeline == "wheel_candidate" and not config.WHEEL_ALERTS_ENABLED:
+                continue
             enriched["score"] = bd.total
             enriched["tier"]  = bd.tier()
             enriched["flags"] = bd.flags
