@@ -188,6 +188,16 @@ def _score_form4(signal: dict) -> tuple[int, list[str]]:
         elif amount >= 100_000:
             score += 15
             flags.append(f"Purchase ${amount:,.0f}")
+
+        if signal.get("is_high_conviction"):
+            score += 20
+            title = signal.get("insider_title", "")
+            flags.append(f"High-conviction role ({title})")
+
+        cluster = signal.get("insider_cluster_count", 0) or 0
+        if cluster >= 2:
+            score += 15
+            flags.append(f"Cluster: {cluster} insider negli ultimi 7gg")
     elif is_sale:
         score = max(score - 10, 0)
         flags.append("Insider sale (bearish)")

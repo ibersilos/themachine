@@ -156,6 +156,28 @@ def _ticker_from_issuer_cik(cik: str) -> str | None:
     return None
 
 
+def _insider_cluster_count(ticker: str, days: int = 7) -> int:
+    """
+    Conta quanti altri segnali form4 sullo stesso ticker sono arrivati
+    negli ultimi N giorni — piu' insider che comprano in cluster e' un
+    segnale piu' forte di un acquisto isolato.
+    """
+    if not ticker:
+        return 0
+    try:
+        from database import _conn
+        conn = _conn()
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT id) FROM signals "
+            "WHERE source='form4' AND ticker=? AND created_at >= datetime('now', ?)",
+            (ticker, f"-{days} days"),
+        ).fetchone()
+        return row[0] if row else 0
+    except Exception as exc:
+        logger.debug("_insider_cluster_count(%s): %s", ticker, exc)
+        return 0
+
+
 def enrich_form4_signal(raw_signal: dict) -> dict:
     """
     Takes a raw Form-4 signal from edgar_monitor and enriches it
@@ -191,6 +213,9 @@ def enrich_form4_signal(raw_signal: dict) -> dict:
         # since that guess can resolve to any party on a joint filing.
         if parsed.get("issuer_ticker"):
             raw_signal["ticker"] = parsed["issuer_ticker"]
+
+        if raw_signal.get("ticker") and parsed.get("transaction_type") == "P":
+            raw_signal["insider_cluster_count"] = _insider_cluster_count(raw_signal["ticker"])
 
         sig_id = raw_signal.get("_db_id")
         if sig_id:
