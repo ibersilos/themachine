@@ -156,7 +156,7 @@ def get_signals(
     Ultimi segnali dal DB.
     Parametri:
       limit     — max righe (default 50)
-      source    — filtra per edgar_8k | form4 | usaspending | serenity
+      source    — filtra per edgar_8k | form4 | usaspending
       min_score — filtra per score minimo
     """
     try:

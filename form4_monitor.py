@@ -10,7 +10,6 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
-from typing import Generator
 
 import requests
 from bs4 import BeautifulSoup
@@ -26,23 +25,60 @@ _HEADERS = {
     "Accept-Encoding": "gzip, deflate",
 }
 
-# Insider roles that carry the strongest conviction signal
-_HIGH_CONVICTION_ROLES = {
-    "Chief Executive Officer", "CEO",
-    "Chief Financial Officer", "CFO",
-    "Chief Operating Officer", "COO",
-    "President", "Chairman",
-    "Director",
-}
+# Insider roles that carry the strongest conviction signal — unambiguous,
+# always C-suite/board regardless of context.
+_HIGH_CONVICTION_ROLES = (
+    "chief executive officer", "ceo",
+    "chief financial officer", "cfo",
+    "chief operating officer", "coo",
+    "chairman",
+)
+
+# "President"/"Director" alone are too generic to trust as substrings —
+# "Vice President of Marketing" and "Director of Engineering" are common
+# non-executive titles on real Form 4 filings that would otherwise match.
+_GENERIC_SENIOR_ROLES = ("president", "director")
+_JUNIOR_TITLE_MODIFIERS = ("vice", "assistant", "associate", "deputy", "acting")
+
+
+def _is_high_conviction_title(title: str) -> bool:
+    t = title.lower()
+    if any(re.search(rf"\b{re.escape(role)}\b", t) for role in _HIGH_CONVICTION_ROLES):
+        return True
+    for generic in _GENERIC_SENIOR_ROLES:
+        for m in re.finditer(rf"\b{generic}\b", t):
+            prefix = t[:m.start()].rstrip()
+            suffix = t[m.end():].lstrip()
+            if any(prefix.endswith(mod) for mod in _JUNIOR_TITLE_MODIFIERS):
+                continue  # "Vice President ...", "Assistant Director ..."
+            if suffix.startswith("of "):
+                continue  # "Director of Engineering", "President of Sales"
+            return True
+    return False
 
 _SEEN_ACCESSIONS: set[str] = set()
 
 
-def _get(url: str, timeout: int = 15) -> requests.Response:
-    resp = requests.get(url, headers=_HEADERS, timeout=timeout)
-    resp.raise_for_status()
-    time.sleep(0.15)
-    return resp
+def _get(url: str, timeout: int = 15, retries: int = 3) -> requests.Response:
+    """
+    GET con retry breve — l'accession di un filing puo' non essere ancora
+    indicizzata da EDGAR nei secondi subito dopo la pubblicazione RSS
+    (lag noto). Senza retry, un fallimento puramente transitorio qui
+    lasciava il ticker a None e il segnale veniva scartato per sempre
+    dal filtro "nessun ticker risolto" di scoring_engine.
+    """
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            resp = requests.get(url, headers=_HEADERS, timeout=timeout)
+            resp.raise_for_status()
+            time.sleep(0.15)
+            return resp
+        except Exception as exc:
+            last_exc = exc
+            if attempt < retries - 1:
+                time.sleep(1.5 * (attempt + 1))
+    raise last_exc
 
 
 def _parse_form4_xml(xml_text: str) -> dict:
@@ -91,9 +127,7 @@ def _parse_form4_xml(xml_text: str) -> dict:
         if title_tag:
             title = title_tag.get_text(strip=True)
             result["insider_title"] = title
-            result["is_high_conviction"] = any(
-                role.lower() in title.lower() for role in _HIGH_CONVICTION_ROLES
-            )
+            result["is_high_conviction"] = _is_high_conviction_title(title)
 
     # Non-derivative transactions (stock purchases/sales)
     for txn in soup.find_all("nonDerivativeTransaction"):
@@ -167,9 +201,16 @@ def _insider_cluster_count(ticker: str, days: int = 7) -> int:
     try:
         from database import _conn
         conn = _conn()
+        # transaction_type vive solo dentro il payload JSON (non e' una
+        # colonna) — json_extract (SQLite JSON1) filtra ai soli acquisti,
+        # altrimenti il conteggio include anche vendite/esercizi/grant
+        # dello stesso ticker, gonfiando il bonus "cluster" per attivita'
+        # che non e' affatto un segnale rialzista.
         row = conn.execute(
             "SELECT COUNT(DISTINCT id) FROM signals "
-            "WHERE source='form4' AND ticker=? AND created_at >= datetime('now', ?)",
+            "WHERE source='form4' AND ticker=? "
+            "AND json_extract(payload, '$.transaction_type') = 'P' "
+            "AND created_at >= datetime('now', ?)",
             (ticker, f"-{days} days"),
         ).fetchone()
         return row[0] if row else 0
@@ -230,33 +271,3 @@ def enrich_form4_signal(raw_signal: dict) -> dict:
         logger.warning("Form 4 XML parse failed for %s: %s", url, exc)
 
     return raw_signal
-
-
-def poll_form4_deep(raw_signals: list[dict]) -> Generator[dict, None, None]:
-    """
-    Enrich a list of raw Form-4 signals from edgar_monitor with
-    full transaction detail. Only yields Purchase (P) transactions.
-    """
-    for sig in raw_signals:
-        enriched = enrich_form4_signal(sig)
-        tx_type = enriched.get("transaction_type")
-
-        # Skip everything that's not a purchase
-        if tx_type and tx_type != "P":
-            logger.debug(
-                "Form-4 skipped (type=%s, ticker=%s)",
-                tx_type, enriched.get("ticker"),
-            )
-            continue
-
-        # Update persisted score=0 signal with enriched payload
-        sig_id = enriched.get("_db_id")
-        if sig_id:
-            from database import tx as db_tx
-            with db_tx() as conn:
-                conn.execute(
-                    "UPDATE signals SET payload=?, ticker=? WHERE id=?",
-                    (json.dumps(enriched), enriched.get("ticker"), sig_id),
-                )
-
-        yield enriched

@@ -26,6 +26,47 @@ def _is_fresh(ticker: str) -> bool:
     return (time.time() - fetched_at) < config.FUNDAMENTALS_CACHE_TTL
 
 
+def quick_market_cap(ticker: str) -> float | None:
+    """
+    Market cap via fast_info — un solo campo leggero, non l'intero .info()
+    (che innesca anche history/option_chain a valle in get_fundamentals).
+    Va chiamato PRIMA di un arricchimento completo per scartare a costo
+    quasi zero i segnali che il filtro di cap avrebbe comunque scartato.
+    """
+    if not ticker:
+        return None
+    try:
+        fast = yf.Ticker(ticker).fast_info
+        cap = fast.get("marketCap") if hasattr(fast, "get") else getattr(fast, "market_cap", None)
+        return float(cap) if cap else None
+    except Exception:
+        return None
+
+
+def _fetch_momentum(yf_ticker) -> dict:
+    """Rendimento % su 1/3/12 mesi — fattore Momentum del quality score."""
+    out = {"momentum_1m": None, "momentum_3m": None, "momentum_1y": None}
+    try:
+        hist = yf_ticker.history(period="1y")
+        if hist.empty or len(hist) < 5:
+            return out
+        closes = hist["Close"]
+        last = float(closes.iloc[-1])
+
+        def _pct_back(days: int) -> float | None:
+            if len(closes) <= days:
+                return None
+            past = float(closes.iloc[-days])
+            return (last - past) / past if past > 0 else None
+
+        out["momentum_1m"] = _pct_back(21)
+        out["momentum_3m"] = _pct_back(63)
+        out["momentum_1y"] = _pct_back(252) if len(closes) >= 252 else _pct_back(len(closes) - 1)
+    except Exception as exc:
+        logger.debug("_fetch_momentum failed: %s", exc)
+    return out
+
+
 def _fetch_total_oi(yf_ticker) -> float | None:
     """Somma dell'open interest della prima scadenza disponibile (proxy liquidità opzioni)."""
     try:
@@ -65,10 +106,13 @@ def get_fundamentals(ticker: str) -> dict:
 
     data = {
         "pe_ratio":        _safe_float(info.get("trailingPE") or info.get("forwardPE")),
+        "price_to_book":   _safe_float(info.get("priceToBook")),
         "revenue_growth":  _safe_float(info.get("revenueGrowth")),
+        "earnings_growth": _safe_float(info.get("earningsGrowth")),
         "debt_to_equity":  _safe_float(info.get("debtToEquity")),
         "market_cap":      _safe_float(info.get("marketCap")),
         "profit_margins":  _safe_float(info.get("profitMargins")),
+        "return_on_equity": _safe_float(info.get("returnOnEquity")),
         "quick_ratio":     _safe_float(info.get("quickRatio")),
         "beta":            _safe_float(info.get("beta")),
         "short_name":      info.get("shortName") or info.get("longName") or ticker,
@@ -80,6 +124,7 @@ def get_fundamentals(ticker: str) -> dict:
         "avg_volume":      _safe_float(info.get("averageVolume") or info.get("averageDailyVolume10Day")),
         "open_interest":   _fetch_total_oi(yf_obj),
         "iv_rank":         None,   # non disponibile da yfinance — richiede IBKR
+        **_fetch_momentum(yf_obj),
     }
 
     _cache[ticker] = (time.time(), data)

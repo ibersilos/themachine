@@ -54,7 +54,7 @@ PICK_VOL_MIN:   int   = _int("PICK_VOL_MIN",       200_000)   # volume medio gio
 PICK_PRICE_MIN: float = _float("PICK_PRICE_MIN",       2.0)   # prezzo minimo $
 PICK_PRICE_MAX: float = _float("PICK_PRICE_MAX",      20.0)   # prezzo massimo $
 
-# WHEEL_CANDIDATES (fonti: edgar_8k + serenity) — filtri base scoring_engine
+# WHEEL_CANDIDATES (fonte: edgar_8k) — filtri base scoring_engine
 WHEEL_CAP_MIN:      int   = _int("WHEEL_CAP_MIN",   1_000_000_000)  # $1B — liquidità opzioni
 WHEEL_OI_MIN:       int   = _int("WHEEL_OI_MIN",             100)   # OI minimo per strike
 WHEEL_VRP_MIN:      float = _float("WHEEL_VRP_MIN",           1.1)  # VRP min (IV/HV20) — stockpile
@@ -65,10 +65,6 @@ WHEEL_DTE_MAX:          int   = _int("WHEEL_DTE_MAX",           42)   # DTE mass
 WHEEL_MAX_SPREAD_PCT:   float = _float("WHEEL_MAX_SPREAD_PCT",  0.10) # max spread bid-ask %
 WHEEL_MIN_PREMIUM:      float = _float("WHEEL_MIN_PREMIUM",     0.30) # premio minimo $/contratto
 WHEEL_ANN_RETURN_MIN:   float = _float("WHEEL_ANN_RETURN_MIN",  15.0) # rendimento annualizzato min %
-
-# Serenity
-SERENITY_ARCHIVE_PATH: Path = Path(os.getenv("SERENITY_ARCHIVE_PATH", "data/serenity_tweets.json"))
-SERENITY_RECENCY_DAYS: int  = _int("SERENITY_RECENCY_DAYS", 30)
 
 # yfinance
 FUNDAMENTALS_CACHE_TTL: int = _int("FUNDAMENTALS_CACHE_TTL", 3600)

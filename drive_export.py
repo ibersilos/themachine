@@ -61,7 +61,8 @@ def export_daily_signals(signals: list[dict]) -> str | None:
         "timestamp", "source", "ticker", "score", "tier",
         "flags", "filing_url", "award_amount",
         "insider_name", "transaction_value_usd",
-        "serenity_confidence", "pe_ratio",
+        "sa_item_count", "sa_eps_surprise", "sa_days_since_latest",
+        "pe_ratio",
     ]
 
     rows = []

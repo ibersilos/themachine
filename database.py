@@ -36,7 +36,7 @@ def init_db() -> None:
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS signals (
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            source      TEXT NOT NULL,          -- edgar | form4 | usaspending | serenity
+            source      TEXT NOT NULL,          -- edgar_8k | form4 | usaspending
             ticker      TEXT,
             score       INTEGER,
             pipeline    TEXT DEFAULT 'unknown', -- stock_picking | wheel_candidate
@@ -170,6 +170,27 @@ def save_signal(source: str, ticker: str | None, score: int, payload: str,
 def mark_alerted(signal_id: int) -> None:
     with tx() as conn:
         conn.execute("UPDATE signals SET alerted=1 WHERE id=?", (signal_id,))
+
+
+def was_recently_alerted(source: str, ticker: str | None, hours: int = 6) -> bool:
+    """
+    True se un segnale della stessa fonte+ticker e' gia' stato alertato
+    nelle ultime `hours` ore in QUESTO database.
+
+    Mitiga (non risolve del tutto) i doppi alert quando il demone locale
+    e il job cloud schedulato girano sullo stesso DB (es. import/export
+    manuale) o quando lo stesso processo scansiona due volte la stessa
+    finestra RSS. Non protegge contro demone locale e job cloud che usano
+    due FILE DB fisicamente separati (limite architetturale noto).
+    """
+    if not ticker:
+        return False
+    row = _conn().execute(
+        "SELECT 1 FROM signals WHERE source=? AND ticker=? AND alerted=1 "
+        "AND created_at >= datetime('now', ?) LIMIT 1",
+        (source, ticker, f"-{hours} hours"),
+    ).fetchone()
+    return row is not None
 
 
 # ── Wheel cycle helpers ───────────────────────────────────────────────────────

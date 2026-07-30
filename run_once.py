@@ -41,7 +41,7 @@ def run_signals() -> None:
     import edgar_monitor
     import form4_monitor
     import usaspending
-    import serenity_validator
+    import seeking_alpha_feed
     import fundamentals
     import scoring_engine
     import telegram_bot
@@ -62,8 +62,18 @@ def run_signals() -> None:
             sig = form4_monitor.enrich_form4_signal(sig)
             if sig.get("transaction_type") and sig["transaction_type"] != "P":
                 return {}
-        sig = serenity_validator.enrich_signal(sig)
+
+        if source == "edgar_8k":
+            # Pre-check economico (1 campo, no history/option_chain) prima
+            # dell'arricchimento pieno: la maggior parte dei segnali 8-K
+            # viene comunque scartata dal filtro cap WHEEL_CAP_MIN — non ha
+            # senso pagare 3-4 round-trip di rete per poi buttarli via.
+            cap = fundamentals.quick_market_cap(sig.get("ticker"))
+            if cap is not None and cap < config.WHEEL_CAP_MIN:
+                return {}
+
         sig = fundamentals.enrich_signal(sig)
+        sig = seeking_alpha_feed.enrich_signal(sig)
         return sig
 
     logger.info("Scansione EDGAR 8-K + Form4 (ultimi filing)...")

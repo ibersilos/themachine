@@ -223,7 +223,7 @@ def poll_form4() -> Generator[dict, None, None]:
 
         sig_id = save_signal(
             source="form4",
-            ticker=ticker,
+            ticker=None,
             score=0,
             payload=json.dumps(signal),
         )

@@ -3,7 +3,7 @@ Scoring engine – converts raw signal dicts into 0-100 scores.
 
 Due pipeline distinte:
   STOCK_PICKING   → form4 + usaspending  → tag [PICK]  🎯
-  WHEEL_CANDIDATE → edgar_8k + serenity  → tag [WHEEL] ⚙️
+  WHEEL_CANDIDATE → edgar_8k             → tag [WHEEL] ⚙️
 
 Ogni pipeline ha filtri dedicati; segnali fuori range vengono scartati
 silenziosamente (filtered=True) senza alert Telegram.
@@ -20,16 +20,21 @@ _PIPELINE_MAP: dict[str, str] = {
     "form4":       "stock_picking",
     "usaspending": "stock_picking",
     "edgar_8k":    "wheel_candidate",
-    "serenity":    "wheel_candidate",
 }
 
-# ── Weights (must sum to 1.0) ─────────────────────────────────────────────────
+# ── Weights per il peso primario (una sola sorgente per segnale) ─────────────
+# fundamentals + seeking_alpha sono supplementari, sommati sopra il primario.
+# NON sono normalizzati a 1.0 e NON sono validati contro alcun backtest —
+# sono costanti tarate a mano. Prima di ritoccarle di nuovo "a sensazione",
+# costruire prima il motore di backtest (prezzo a T0/T0+N per ogni alert)
+# per avere un modo di verificare se un cambiamento migliora o peggiora la
+# qualita' dei segnali, invece di continuare a tarare al buio.
 WEIGHTS = {
-    "edgar_8k":    0.30,
-    "form4":       0.25,
-    "usaspending": 0.20,
-    "serenity":    0.15,
-    "fundamentals": 0.10,
+    "edgar_8k":      0.30,
+    "form4":         0.45,
+    "usaspending":   0.40,
+    "fundamentals":  0.35,
+    "seeking_alpha": 0.20,
 }
 
 
@@ -234,24 +239,28 @@ def _score_usaspending(signal: dict) -> tuple[int, list[str]]:
     return min(score, 100), flags
 
 
-def _score_serenity(signal: dict) -> tuple[int, list[str]]:
+def _score_seeking_alpha(signal: dict) -> tuple[int, list[str]]:
+    """Sostituisce Serenity — notizie/earnings reali da feed Seeking Alpha per ticker."""
     score = 0
     flags = []
 
-    confidence = signal.get("serenity_confidence", 0)
-    score = int(confidence * 100)
+    days_since = signal.get("sa_days_since_latest")
+    if days_since is not None and days_since <= 3:
+        score += 20
+        flags.append(f"SA: notizia recente ({days_since}gg fa)")
 
-    if signal.get("serenity_recent_mention"):
-        score = min(score + 20, 100)
-        flags.append("Recent Serenity mention")
-
-    sentiment = signal.get("serenity_sentiment", "neutral")
-    if sentiment == "bullish":
-        score = min(score + 10, 100)
-        flags.append("Serenity bullish sentiment")
-    elif sentiment == "bearish":
+    surprise = signal.get("sa_eps_surprise")
+    if surprise == "beat":
+        score += 40
+        flags.append("SA: EPS beat recente")
+    elif surprise == "miss":
         score = max(score - 30, 0)
-        flags.append("Serenity bearish")
+        flags.append("SA: EPS miss recente")
+
+    item_count = signal.get("sa_item_count", 0) or 0
+    if item_count >= 5:
+        score += 15
+        flags.append(f"SA: copertura attiva ({item_count} articoli)")
 
     return min(score, 100), flags
 
@@ -262,37 +271,52 @@ def _score_fundamentals(signal: dict) -> tuple[int, list[str]]:
 
     pe = signal.get("pe_ratio")
     if pe and 5 < pe < 20:
-        score += 30
+        score += 20
         flags.append(f"PE={pe:.1f} (attractive)")
     elif pe and pe < 5:
-        score += 15
+        score += 10
         flags.append(f"PE={pe:.1f} (very low)")
 
     rev_growth = signal.get("revenue_growth")
     if rev_growth and rev_growth > 0.20:
-        score += 30
+        score += 20
         flags.append(f"Revenue growth {rev_growth*100:.0f}%")
     elif rev_growth and rev_growth > 0.05:
-        score += 15
+        score += 10
         flags.append(f"Revenue growth {rev_growth*100:.0f}%")
 
     debt_eq = signal.get("debt_to_equity")
     if debt_eq is not None and debt_eq < 0.5:
-        score += 20
+        score += 15
         flags.append("Low D/E ratio")
     elif debt_eq is not None and debt_eq > 2.0:
         score -= 10
         flags.append("High D/E ratio")
 
+    roe = signal.get("return_on_equity")
+    if roe and roe > 0.15:
+        score += 15
+        flags.append(f"ROE {roe*100:.0f}%")
+
+    mom_1m = signal.get("momentum_1m")
+    mom_3m = signal.get("momentum_3m")
+    if mom_1m is not None and mom_3m is not None:
+        if mom_1m > 0 and mom_3m > 0:
+            score += 15
+            flags.append(f"Momentum positivo (1m {mom_1m*100:+.0f}%, 3m {mom_3m*100:+.0f}%)")
+        elif mom_1m < -0.15:
+            score = max(score - 15, 0)
+            flags.append(f"Momentum negativo (1m {mom_1m*100:+.0f}%)")
+
     return max(min(score, 100), 0), flags
 
 
 _SCORERS = {
-    "edgar_8k":     _score_edgar_8k,
-    "form4":        _score_form4,
-    "usaspending":  _score_usaspending,
-    "serenity":     _score_serenity,
-    "fundamentals": _score_fundamentals,
+    "edgar_8k":      _score_edgar_8k,
+    "form4":         _score_form4,
+    "usaspending":   _score_usaspending,
+    "seeking_alpha": _score_seeking_alpha,
+    "fundamentals":  _score_fundamentals,
 }
 
 
@@ -332,11 +356,11 @@ def score_signal(signal: dict) -> ScoreBreakdown:
     else:
         logger.warning("Unknown signal source: %s", source)
 
-    for supplementary in ("serenity", "fundamentals"):
+    for supplementary in ("seeking_alpha", "fundamentals"):
         if supplementary == source:
             continue
-        if supplementary == "serenity" and not signal.get("serenity_confidence", 0):
-            continue  # nessun dato Serenity — skip senza penalità
+        if supplementary == "seeking_alpha" and not signal.get("sa_item_count"):
+            continue  # nessun dato Seeking Alpha — skip senza penalità
         s_scorer = _SCORERS[supplementary]
         raw, flags = s_scorer(signal)
         if raw > 0:

@@ -21,6 +21,11 @@ logger = logging.getLogger(__name__)
 _BASE = "https://api.usaspending.gov/api/v2"
 _SEEN_IDS: set[str] = set()
 
+# Cache nome-beneficiario -> ticker (o None). Senza questa, lo stesso
+# fornitore ricorrente (comune per contratti governativi abituali) ripaga
+# la stessa yf.Search di rete a ogni scan da 2h, per sempre.
+_TICKER_LOOKUP_CACHE: dict[str, str | None] = {}
+
 # Company-name fragments → ticker overrides for common defense/gov contractors
 _KNOWN_CONTRACTORS: dict[str, str] = {
     "lockheed":        "LMT",
@@ -43,19 +48,46 @@ _KNOWN_CONTRACTORS: dict[str, str] = {
 }
 
 
+# Frammenti che indicano un ente governativo/municipale, mai un'azienda quotata.
+# Query USAspending ordinate per importo pescano quasi solo questo genere di
+# beneficiario (stato/contea/città, consorzi LLC di gestione impianti federali)
+# — filtrarli qui evita chiamate yfinance sprecate e falsi "ticker non trovato".
+_GOV_ENTITY_MARKERS = (
+    "state of ", "city of ", "county of ", "office of ", "department of ",
+    "division of ", "commonwealth of ", " county", " municipal", " township",
+    "public works", "emergency management", "emergency services",
+    "national security, llc", "national laboratory", "cooperative, inc.",
+)
+
+
+def _looks_like_gov_entity(name: str) -> bool:
+    name_lower = name.lower()
+    return any(marker in name_lower for marker in _GOV_ENTITY_MARKERS)
+
+
 def _recipient_to_ticker(name: str) -> str | None:
+    if name in _TICKER_LOOKUP_CACHE:
+        return _TICKER_LOOKUP_CACHE[name]
+
+    if _looks_like_gov_entity(name):
+        _TICKER_LOOKUP_CACHE[name] = None
+        return None
+
     name_lower = name.lower()
     for fragment, ticker in _KNOWN_CONTRACTORS.items():
         if fragment in name_lower:
+            _TICKER_LOOKUP_CACHE[name] = ticker
             return ticker
-    # Fallback: try yfinance search (slow, use sparingly)
+    # Fallback: try yfinance search (slow, use sparingly — result cached)
+    ticker = None
     try:
         results = yf.Search(name, max_results=1).quotes
         if results:
-            return results[0].get("symbol")
+            ticker = results[0].get("symbol")
     except Exception:
         pass
-    return None
+    _TICKER_LOOKUP_CACHE[name] = ticker
+    return ticker
 
 
 def _fetch_recent_awards(days_back: int = 1, limit: int = 50) -> list[dict]:
@@ -72,8 +104,15 @@ def _fetch_recent_awards(days_back: int = 1, limit: int = 50) -> list[dict]:
             "Award ID", "Recipient Name", "Award Amount",
             "Awarding Agency Name", "Description",
             "Action Date", "Period of Performance Start Date",
+            "Last Modified Date",
         ],
-        "sort": "Award Amount",
+        # Ordinato per data di ultima modifica, non per importo: ordinare per
+        # importo decrescente polarizza verso mega-contratti a consorzi/enti
+        # non quotabili (visto nei dati reali: laboratori nazionali, enti
+        # statali) invece di dare spazio a small/mid cap con contratti
+        # materiali ma non giganteschi. "Action Date" non e' ordinabile
+        # sull'API — "Last Modified Date" e' il campo valido piu' vicino.
+        "sort": "Last Modified Date",
         "order": "desc",
         "limit": limit,
         "page": 1,
@@ -105,8 +144,11 @@ def _fetch_recent_grants(days_back: int = 1, limit: int = 30) -> list[dict]:
         "fields": [
             "Award ID", "Recipient Name", "Award Amount",
             "Awarding Agency Name", "Description", "Action Date",
+            "Last Modified Date",
         ],
-        "sort": "Award Amount",
+        # Vedi commento in _fetch_recent_awards: "Last Modified Date" e' il
+        # campo ordinabile valido piu' vicino a "piu' recente prima".
+        "sort": "Last Modified Date",
         "order": "desc",
         "limit": limit,
         "page": 1,

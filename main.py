@@ -19,7 +19,7 @@ import database as db
 import edgar_monitor
 import usaspending
 import form4_monitor
-import serenity_validator
+import seeking_alpha_feed
 import fundamentals
 import scoring_engine
 import wheel_scanner
@@ -42,7 +42,7 @@ _last_export_date: str = ""
 
 
 def _enrich(sig: dict) -> dict:
-    """Attach Serenity + Fundamentals data to any signal that has a ticker."""
+    """Attach Seeking Alpha + Fundamentals data to any signal that has a ticker."""
     source = sig.get("source", "")
 
     # Form-4 deep parse
@@ -53,12 +53,20 @@ def _enrich(sig: dict) -> dict:
         if tx and tx != "P":
             return {}   # empty dict signals "skip this"
 
-    # Serenity + Fundamentals always
-    sig = serenity_validator.enrich_signal(sig)
+    if source == "edgar_8k":
+        # Pre-check economico prima dell'arricchimento pieno — vedi
+        # run_once.py._enrich per il razionale (evita 3-4 round-trip di
+        # rete su segnali che il filtro cap WHEEL_CAP_MIN scarta comunque).
+        cap = fundamentals.quick_market_cap(sig.get("ticker"))
+        if cap is not None and cap < config.WHEEL_CAP_MIN:
+            return {}
+
+    # Fundamentals + Seeking Alpha sempre
     sig = fundamentals.enrich_signal(sig)
+    sig = seeking_alpha_feed.enrich_signal(sig)
 
     # WHEEL pipeline: esegui options scan (3-tier wheel-scout + VRP stockpile)
-    if source in ("edgar_8k", "serenity") and sig.get("ticker"):
+    if source == "edgar_8k" and sig.get("ticker"):
         ws = wheel_scanner.scan_wheel_candidate(sig["ticker"])
         if ws:
             sig["wheel_scan"] = ws
@@ -175,7 +183,7 @@ def main() -> None:
 
     telegram_bot.send_alert(
         "🟢 *the-machine online*\n"
-        "Sources: SEC 8-K · Form 4 · USAspending · Serenity · yfinance\n"
+        "Sources: SEC 8-K · Form 4 · USAspending · Seeking Alpha · yfinance\n"
         "Wheel advisor attivo — usa /wheel /open /close /suggest /income /addpos"
     )
 

@@ -146,7 +146,7 @@ def _format_wheel_alert(bd: ScoreBreakdown, signal: dict) -> str:
     """Layout options desk per pipeline WHEEL_CANDIDATES."""
     ticker  = bd.ticker or "N/A"
     url     = signal.get("filing_url") or signal.get("award_url") or ""
-    source_labels = {"edgar_8k": "SEC 8-K", "serenity": "Serenity"}
+    source_labels = {"edgar_8k": "SEC 8-K"}
     source  = source_labels.get(signal.get("source", ""), signal.get("source", ""))
 
     cap    = signal.get("market_cap")
@@ -251,6 +251,10 @@ def dispatch_signal(bd: ScoreBreakdown, signal: dict) -> None:
         return
 
     if bd.total < config.MIN_ALERT_SCORE:
+        return
+
+    if db.was_recently_alerted(signal.get("source", ""), bd.ticker):
+        logger.info("Alert soppresso (gia' inviato di recente): %s %s", signal.get("source"), bd.ticker)
         return
 
     msg = _format_signal_alert(bd, signal)
