@@ -111,6 +111,9 @@ HOGUE_HIGH_IV_RANK: float     = _float("HOGUE_HIGH_IV_RANK", 80.0)
 HOGUE_WEEKLY_DROP_BLOCK: float = _float("HOGUE_WEEKLY_DROP_BLOCK", 0.10)
 # Giorni da earnings per bloccare automaticamente vendita calls
 HOGUE_EARNINGS_BUFFER_DAYS: int = _int("HOGUE_EARNINGS_BUFFER_DAYS", 7)
+# Giorni prima dell'ex-dividend entro cui avvisare sul rischio di assegnazione anticipata
+# per cicli covered call gia' aperti (non solo in fase di apertura nuovo ciclo)
+HOGUE_DIV_WARNING_DAYS: int = _int("HOGUE_DIV_WARNING_DAYS", 7)
 # Profitto su stock per triggera Collar automatico
 HOGUE_COLLAR_TRIGGER_PCT: float = _float("HOGUE_COLLAR_TRIGGER_PCT", 0.20)
 # Collar: costo netto sotto cui segnalare come "protezione quasi gratuita"

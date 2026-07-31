@@ -316,6 +316,38 @@ def _check_cycle(cycle_row) -> None:
 
     stock_price = _current_price(ticker_obj)
 
+    # ── Ex-dividend risk check ──────────────────────────────────────────────
+    # _check_dividend_warnings() salta i ticker con un ciclo aperto assumendo
+    # che sia gestito qui — per le CSP il dividendo non e' un rischio di
+    # assegnazione anticipata (chi eserciterebbe una put per pagare di piu'?),
+    # quindi il check si applica solo alle covered call.
+    if phase == "covered_call":
+        ex_div = _next_ex_div(ticker_obj)
+        if ex_div:
+            days_to_div = (ex_div - date.today()).days
+            if 0 <= days_to_div <= config.HOGUE_DIV_WARNING_DAYS and ex_div <= expiry_d:
+                ann_div = _annual_dividend(ticker_obj)
+                div_per_share = ann_div / 4  # approssimazione trimestrale
+                intrinsic = max(stock_price - strike, 0) if stock_price else 0.0
+                extrinsic = prem_now - intrinsic
+                at_risk = intrinsic > 0 and extrinsic < div_per_share
+
+                icon = "🚨" if at_risk else "💰"
+                risk_line = (
+                    f"*A RISCHIO ASSEGNAZIONE* — valore estrinseco (`${extrinsic:.2f}`) sotto il "
+                    f"dividendo stimato (`${div_per_share:.2f}`). Valuta di ricomprare la call "
+                    f"entro la sera prima dell'ex-div per non perdere le azioni."
+                    if at_risk else
+                    f"Estrinseco `${extrinsic:.2f}` sopra il dividendo stimato `${div_per_share:.2f}` — "
+                    f"assegnazione anticipata improbabile per ora, ricontrolla avvicinandoti alla data."
+                )
+                send_alert(
+                    f"{icon} *EX-DIVIDEND RISK — {ticker}*\n"
+                    f"Ex-div: `{ex_div}` (tra {days_to_div} giorni)\n"
+                    f"Stock: `${stock_price:.2f}` vs strike `${strike:.1f}` | Call: `${prem_now:.2f}`\n\n"
+                    f"_{risk_line}_"
+                )
+
     # ── Hogue checks ─────────────────────────────────────────────────────────
     close_action = _opt.check_early_close(position)
     if close_action.action == "close":
