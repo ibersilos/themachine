@@ -1,8 +1,9 @@
 """
 run_once.py — esecuzione one-shot per GitHub Actions.
 
-  python run_once.py --mode wheel    # check posizioni wheel + advisory Hogue
-  python run_once.py --mode signals  # scan EDGAR/Form4/USAspending + alert
+  python run_once.py --mode wheel     # check posizioni wheel + advisory Hogue
+  python run_once.py --mode signals   # scan EDGAR/Form4/USAspending + alert
+  python run_once.py --mode backtest  # ritorno realizzato T0..T0+N per segnali alertati
 """
 import argparse
 import logging
@@ -107,12 +108,30 @@ def run_signals() -> None:
         logger.info("%d alert inviati su Telegram.", alerts_sent)
 
 
+def run_backtest() -> None:
+    import database as db
+    import backtest_engine
+    import telegram_bot
+
+    db.init_db()
+
+    logger.info("Eseguo backtest pass...")
+    n = backtest_engine.run_pass()
+    logger.info("%d segnali aggiornati.", n)
+
+    report = backtest_engine.format_report()
+    logger.info("Report backtest:\n%s", report)
+    telegram_bot.send_alert(f"📈 *Backtest settimanale* ({n} segnali aggiornati)\n```\n{report}\n```")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--mode", choices=["wheel", "signals"], required=True)
+    parser.add_argument("--mode", choices=["wheel", "signals", "backtest"], required=True)
     args = parser.parse_args()
 
     if args.mode == "wheel":
         run_wheel()
     elif args.mode == "signals":
         run_signals()
+    elif args.mode == "backtest":
+        run_backtest()

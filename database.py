@@ -111,6 +111,30 @@ def init_db() -> None:
             balance_after REAL NOT NULL,
             created_at  TEXT DEFAULT (datetime('now'))
         );
+
+        -- Backtest: ritorno realizzato T0..T0+N per ogni segnale alertato,
+        -- per validare se lo score della pipeline correla con edge reale.
+        CREATE TABLE IF NOT EXISTS backtest_results (
+            signal_id   INTEGER PRIMARY KEY REFERENCES signals(id),
+            ticker      TEXT NOT NULL,
+            score       INTEGER,
+            source      TEXT,
+            pipeline    TEXT,
+            t0_date     TEXT,
+            t0_price    REAL,
+            t5_price    REAL,
+            t10_price   REAL,
+            t20_price   REAL,
+            t60_price   REAL,
+            return_5d   REAL,
+            return_10d  REAL,
+            return_20d  REAL,
+            return_60d  REAL,
+            updated_at  TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_backtest_score  ON backtest_results(score);
+        CREATE INDEX IF NOT EXISTS idx_backtest_source ON backtest_results(source);
         """)
         # Migrazione: aggiungi colonna pipeline se non esiste (DB pre-dual-pipeline)
         try:
@@ -408,3 +432,81 @@ def log_capital(event: str, amount: float, ticker: str | None = None,
             (event, amount, ticker, note, new_bal),
         )
         return new_bal
+
+
+# ── Backtest helpers ──────────────────────────────────────────────────────────
+
+def get_signals_for_backtest(min_age_days: int, max_age_days: int, limit: int = 200) -> list:
+    """
+    Segnali alertati, con ticker, abbastanza vecchi da avere almeno il
+    ritorno a 5gg disponibile, non piu' vecchi di max_age_days (oltre non
+    ha senso riprovare a scaricare storico), e non ancora completi
+    (return_60d mancante = manca almeno un orizzonte).
+    """
+    return _conn().execute(
+        """
+        SELECT s.id, s.ticker, s.score, s.source, s.pipeline, s.created_at
+        FROM signals s
+        LEFT JOIN backtest_results b ON b.signal_id = s.id
+        WHERE s.ticker IS NOT NULL
+          AND s.alerted = 1
+          AND s.created_at <= datetime('now', ?)
+          AND s.created_at >= datetime('now', ?)
+          AND (b.signal_id IS NULL OR b.return_60d IS NULL)
+        ORDER BY s.created_at ASC
+        LIMIT ?
+        """,
+        (f"-{min_age_days} days", f"-{max_age_days} days", limit),
+    ).fetchall()
+
+
+def upsert_backtest_result(signal_id: int, ticker: str, score: int | None,
+                           source: str | None, pipeline: str | None,
+                           t0_date: str, prices: dict, returns: dict) -> None:
+    with tx() as conn:
+        conn.execute(
+            """
+            INSERT INTO backtest_results
+                (signal_id, ticker, score, source, pipeline, t0_date, t0_price,
+                 t5_price, t10_price, t20_price, t60_price,
+                 return_5d, return_10d, return_20d, return_60d, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?, datetime('now'))
+            ON CONFLICT(signal_id) DO UPDATE SET
+                t0_price=excluded.t0_price,
+                t5_price=excluded.t5_price, t10_price=excluded.t10_price,
+                t20_price=excluded.t20_price, t60_price=excluded.t60_price,
+                return_5d=excluded.return_5d, return_10d=excluded.return_10d,
+                return_20d=excluded.return_20d, return_60d=excluded.return_60d,
+                updated_at=datetime('now')
+            """,
+            (signal_id, ticker, score, source, pipeline, t0_date, prices.get("t0"),
+             prices.get(5), prices.get(10), prices.get(20), prices.get(60),
+             returns.get(5), returns.get(10), returns.get(20), returns.get(60)),
+        )
+
+
+def get_backtest_report() -> list:
+    """Aggrega i ritorni per bucket di score e per fonte del segnale."""
+    return _conn().execute(
+        """
+        SELECT
+            source,
+            CASE
+                WHEN score >= 50 THEN '50+'
+                WHEN score >= 40 THEN '40-49'
+                WHEN score >= 30 THEN '30-39'
+                WHEN score >= 20 THEN '20-29'
+                ELSE '<20'
+            END AS bucket,
+            COUNT(*) AS n,
+            AVG(return_5d)  AS avg_5d,
+            AVG(return_10d) AS avg_10d,
+            AVG(return_20d) AS avg_20d,
+            AVG(return_60d) AS avg_60d,
+            SUM(CASE WHEN return_20d > 0 THEN 1 ELSE 0 END) * 1.0
+                / NULLIF(SUM(CASE WHEN return_20d IS NOT NULL THEN 1 ELSE 0 END), 0) AS win_rate_20d
+        FROM backtest_results
+        GROUP BY source, bucket
+        ORDER BY source, bucket DESC
+        """
+    ).fetchall()
