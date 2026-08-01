@@ -14,8 +14,8 @@ from scipy.stats import norm
 warnings.filterwarnings("ignore")
 
 TICKER         = "F"
-BACKTEST_YEARS = 2
-TARGET_DTE     = 35
+BACKTEST_YEARS = 5
+TARGET_DTE     = 20
 OTM_PCT        = 0.03    # strike +3% OTM per CC, -3% per CSP
 EARLY_CLOSE    = 0.50
 DTE_RULE       = 21
@@ -40,12 +40,11 @@ def bs_put(S, K, T, r, sigma):
     return K * math.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
 
 
-def hv20(prices, idx, window=20):
-    if idx < window + 1:
-        return 0.35
-    sl = prices.iloc[idx - window - 1 : idx]
-    lr = np.log(sl / sl.shift(1)).dropna()
-    return float(lr.std() * np.sqrt(252))
+def precompute_hv20(prices, window=20):
+    """Vettorizzato una volta sola — evita di ricreare Series pandas per ogni giorno."""
+    log_ret = np.log(prices / prices.shift(1))
+    roll_std = log_ret.rolling(window).std() * np.sqrt(252)
+    return roll_std.fillna(0.35).to_numpy()
 
 
 def round_ford_strike(x):
@@ -55,7 +54,7 @@ def round_ford_strike(x):
 
 def main():
     print(f"\nCaricamento dati {TICKER}...")
-    hist = yf.Ticker(TICKER).history(period="3y")
+    hist = yf.Ticker(TICKER).history(period=f"{BACKTEST_YEARS + 1}y")
     if isinstance(hist.columns, pd.MultiIndex):
         hist = hist["Close"].to_frame("Close")
     hist = hist[["Close"]].copy()
@@ -68,6 +67,12 @@ def main():
     all_days  = hist.index.tolist()
     tdays     = [d for d in all_days if d.date() >= start_date]
 
+    # Lookup O(1) invece di list.index() O(n) ripetuto per ogni giorno simulato
+    # (con centinaia/migliaia di chiamate il costo O(n) diventa O(n^2) complessivo).
+    day_to_pos   = {d: i for i, d in enumerate(all_days)}
+    tday_to_pos  = {d: i for i, d in enumerate(tdays)}
+    hv_arr       = precompute_hv20(prices)
+
     entry_stock_price = float(prices[prices.index.date >= start_date].iloc[0])
     initial_capital   = entry_stock_price * SHARES
     print(f"Prezzo Ford il {start_date}: ${entry_stock_price:.2f} | Capitale 100az: ${initial_capital:.2f}\n")
@@ -77,13 +82,22 @@ def main():
     cash  = 0.0    # premi accumulati
     cycles = []
     cursor_idx = 0
+    _prev_cursor = -1
+    _iter_guard = 0
 
     while cursor_idx < len(tdays):
+        _iter_guard += 1
+        if cursor_idx == _prev_cursor:
+            # Sicurezza: non dovrebbe più accadere (bug del cursore fisso risolto),
+            # ma previene un hang silenzioso se una futura modifica reintroduce il problema.
+            print(f"[WARN] cursor_idx non avanza a {cursor_idx} (iter {_iter_guard}) — interrotto per sicurezza")
+            break
+        _prev_cursor = cursor_idx
         entry_dt   = tdays[cursor_idx]
         entry_date = entry_dt.date()
-        full_idx   = all_days.index(entry_dt)
+        full_idx   = day_to_pos[entry_dt]
         S          = float(prices.iloc[full_idx])
-        vol        = hv20(prices, full_idx)
+        vol        = float(hv_arr[full_idx])
         T          = TARGET_DTE / 365.0
 
         if phase == "cc":
@@ -103,14 +117,15 @@ def main():
             "assigned": False, "rolled": 0,
         }
 
-        roll_count = 0
-        closed     = False
+        roll_count      = 0
+        closed          = False
+        advanced_inline = False   # True se il cursore e' gia' stato avanzato dentro il ramo early-close
 
         for td in tdays[cursor_idx + 1 :]:
             td_date = td.date()
-            fi      = all_days.index(td)
+            fi      = day_to_pos[td]
             S_i     = float(prices.iloc[fi])
-            vol_i   = hv20(prices, fi)
+            vol_i   = float(hv_arr[fi])
             dte     = (expiry_date - td_date).days
 
             # Scadenza raggiunta
@@ -155,7 +170,8 @@ def main():
                 cyc["close_date"] = td_date
                 cash += cyc["pnl"]
                 closed = True
-                cursor_idx = tdays.index(td)
+                cursor_idx = tday_to_pos[td]
+                advanced_inline = True
                 break
 
             # Roll CC se stock sale verso strike
@@ -182,12 +198,15 @@ def main():
 
         cycles.append(cyc)
 
-        if not closed or cyc["assigned"] or "Scaduta" in cyc["exit"] or "Fine" in cyc["exit"]:
+        if not advanced_inline:
             close_t = cyc["close_date"]
-            nxt = [d for d in tdays if d.date() > close_t]
-            if not nxt:
+            nxt_pos = next(
+                (i for i in range(cursor_idx + 1, len(tdays)) if tdays[i].date() > close_t),
+                None,
+            )
+            if nxt_pos is None:
                 break
-            cursor_idx = tdays.index(nxt[0])
+            cursor_idx = nxt_pos
 
     # ── Statistiche ────────────────────────────────────────────────────────────
     n          = len(cycles)
