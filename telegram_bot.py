@@ -340,7 +340,7 @@ async def _cmd_wheel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             except Exception:
                 dte = "?"
             lines.append(
-                f"  `{c['ticker']}` {c['phase'].upper()} `${float(c['strike']):.1f}` "
+                f"  `{c['ticker']}` {c['phase'].replace('_', ' ').upper()} `${float(c['strike']):.1f}` "
                 f"scad `{c['expiry']}` ({dte} DTE) — {pct}% catturato"
             )
     else:

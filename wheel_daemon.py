@@ -177,7 +177,7 @@ def suggest_next_cycle(ticker: str, phase: str = "cc") -> dict:
 def _fmt_advisory(cycle_row, action_str: str, detail: str, urgency: str = "normal") -> str:
     icon = {"immediate": "🚀", "normal": "📋", "info": "ℹ️"}.get(urgency, "📋")
     ticker  = cycle_row["ticker"]
-    phase   = cycle_row["phase"].upper()
+    phase   = cycle_row["phase"].replace("_", " ").upper()
     strike  = float(cycle_row["strike"])
     expiry  = cycle_row["expiry"]
     prem_r  = float(cycle_row["premium_received"])
@@ -356,7 +356,7 @@ def _check_cycle(cycle_row) -> None:
         rule = "21-DTE" if dte <= config.HOGUE_DTE_THRESHOLD else "50%"
         msg = _fmt_advisory(
             cycle_row,
-            action_str=f"CHIUDI la {phase.upper()} — regola {rule}",
+            action_str=f"CHIUDI la {phase.replace('_', ' ').upper()} — regola {rule}",
             detail=(
                 f"Ricompra la {opt_type.upper()} {ticker} ${strike:.1f} scad {expiry_str} "
                 f"a circa ${prem_now:.2f}. Profitto: ${profit_usd:.2f}. "
