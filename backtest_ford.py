@@ -22,6 +22,7 @@ DTE_RULE       = 21
 MAX_ROLLS      = 2
 RISK_FREE      = 0.05
 SHARES         = 100
+COMMISSION     = 1.0     # $/ordine (IBKR, minimo per opzioni singole)
 
 
 def bs_call(S, K, T, r, sigma):
@@ -196,6 +197,17 @@ def main():
             cyc["pnl"]        = prem_open * SHARES
             cash += cyc["pnl"]
 
+        # Commissioni: 1 ordine di apertura + 2 per ogni roll (chiudi+riapri)
+        # + 1 di buy-to-close se chiusura anticipata. Scadenza OTM e assegnazione
+        # non generano un ordine opzioni aggiuntivo (nessun buy-back necessario).
+        orders = 1 + 2 * cyc["rolled"]
+        if "Chiusura anticipata" in cyc["exit"]:
+            orders += 1
+        commission = orders * COMMISSION
+        cyc["commission"] = commission
+        cyc["pnl"]       -= commission
+        cash             -= commission
+
         cycles.append(cyc)
 
         if not advanced_inline:
@@ -209,8 +221,10 @@ def main():
             cursor_idx = nxt_pos
 
     # ── Statistiche ────────────────────────────────────────────────────────────
-    n          = len(cycles)
-    total_prem = sum(c["pnl"] for c in cycles)
+    n           = len(cycles)
+    total_prem  = sum(c["pnl"] for c in cycles)          # netto, commissioni gia' sottratte
+    total_comm  = sum(c["commission"] for c in cycles)
+    gross_prem  = total_prem + total_comm
     assigned_n = sum(1 for c in cycles if c["assigned"])
     early_n    = sum(1 for c in cycles if "anticipata" in c["exit"])
     cc_n       = sum(1 for c in cycles if c["phase"] == "CC")
@@ -241,9 +255,11 @@ def main():
     print(f"  Roll eseguiti:    {roll_tot}")
     print()
     print(f"  Premio medio/ciclo:   ${avg_pnl:.1f}")
-    print(f"  Premi totali:         ${total_prem:.0f}")
-    print(f"  Premi annui:          ${ann_prem:.0f}/anno")
-    print(f"  Rendimento premi:     {ann_pct:+.1f}%/anno sul capitale iniziale")
+    print(f"  Premi lordi totali:   ${gross_prem:.0f}")
+    print(f"  Commissioni totali:   ${total_comm:.0f}  (${COMMISSION:.2f}/ordine)")
+    print(f"  Premi netti totali:   ${total_prem:.0f}")
+    print(f"  Premi netti annui:    ${ann_prem:.0f}/anno")
+    print(f"  Rendimento netto:     {ann_pct:+.1f}%/anno sul capitale iniziale")
     print()
     print(f"  Buy & Hold:           ${bh_start:.2f} -> ${bh_end:.2f}")
     print(f"  B&H PnL:              ${bh_pnl:+.0f} ({bh_ret:+.1f}% totale, {bh_ann:+.1f}%/anno)")
