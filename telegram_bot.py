@@ -105,6 +105,16 @@ def _52w_bar(price, low, high, width=10) -> str:
     return f"`{bar}` {pct*100:.0f}%"
 
 
+def _verdict_line(bd: ScoreBreakdown) -> str:
+    """Riga di verdetto finale — riassume in linguaggio semplice il tier gia' calcolato."""
+    labels = {
+        "STRONG BUY": "🔥 *STRONG BUY* — segnale forte, priorita' alta",
+        "BUY ALERT":  "📡 *BUY ALERT* — sopra soglia, vale un'occhiata",
+        "WATCH":      "👁 *WATCH* — sotto soglia operativa, solo osservazione",
+    }
+    return labels.get(bd.tier(), bd.tier())
+
+
 def _format_pick_alert(bd: ScoreBreakdown, signal: dict) -> str:
     """Layout stock scanner per pipeline STOCK_PICKING."""
     ticker  = bd.ticker or "N/A"
@@ -135,6 +145,8 @@ def _format_pick_alert(bd: ScoreBreakdown, signal: dict) -> str:
     if bd.flags:
         for f in bd.flags:
             lines.append(f"  • {f}")
+    lines.append("─────────────────────────")
+    lines.append(_verdict_line(bd))
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     lines.append(f"\n🕐 `{ts}`")
     if url:
@@ -197,6 +209,8 @@ def _format_wheel_alert(bd: ScoreBreakdown, signal: dict) -> str:
     if bd.flags:
         for f in bd.flags:
             lines.append(f"  • {f}")
+    lines.append("─────────────────────────")
+    lines.append(_verdict_line(bd))
     ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
     lines.append(f"\n🕐 `{ts}`")
     if url:
@@ -219,6 +233,8 @@ def _format_signal_alert(bd: ScoreBreakdown, signal: dict) -> str:
     ]
     for f in bd.flags:
         lines.append(f"  • {f}")
+    lines.append("")
+    lines.append(_verdict_line(bd))
     if url:
         lines.append(f"\n[View filing]({url})")
     lines.append(f"\n🕐 `{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}`")
