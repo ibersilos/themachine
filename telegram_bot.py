@@ -244,15 +244,28 @@ def _format_signal_alert(bd: ScoreBreakdown, signal: dict) -> str:
 # ── Public send functions ─────────────────────────────────────────────────────
 
 def send_alert(text: str) -> None:
-    """Fire-and-forget alert — httpx sync, funziona da qualsiasi thread/contesto."""
+    """
+    Fire-and-forget alert — httpx sync, funziona da qualsiasi thread/contesto.
+    Se il Markdown e' malformato (es. underscore/asterisco spaiati) Telegram
+    risponde 400 senza sollevare eccezione lato client — prima veniva ignorato
+    silenziosamente. Ora logga l'errore e ritenta in plain text, cosi' il
+    messaggio arriva comunque invece di sparire senza traccia.
+    """
     try:
         with httpx.Client(timeout=10) as client:
-            client.post(f"{_TG_API}/sendMessage", json={
+            resp = client.post(f"{_TG_API}/sendMessage", json={
                 "chat_id": config.TELEGRAM_CHAT_ID,
                 "text": text,
                 "parse_mode": "Markdown",
                 "disable_web_page_preview": True,
             })
+            if resp.status_code != 200:
+                logger.error("Telegram send failed (%d): %s — ritento in plain text", resp.status_code, resp.text)
+                client.post(f"{_TG_API}/sendMessage", json={
+                    "chat_id": config.TELEGRAM_CHAT_ID,
+                    "text": text,
+                    "disable_web_page_preview": True,
+                })
     except Exception as exc:
         logger.error("Telegram send failed: %s", exc)
 

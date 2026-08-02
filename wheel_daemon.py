@@ -241,7 +241,7 @@ def _fmt_weekly_report(positions: list, year: int, month: int) -> str:
         for c in report["open_cycles"]:
             pnl_open = (float(c["premium_received"]) - float(c["premium_current"])) * 100
             lines.append(
-                f"  `{c['ticker']}` {c['phase']} — "
+                f"  `{c['ticker']}` {c['phase'].replace('_', ' ').upper()} — "
                 f"catturato `${pnl_open:.2f}` finora"
             )
 
