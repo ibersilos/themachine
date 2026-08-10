@@ -29,16 +29,13 @@ def run_wheel() -> None:
         db.upsert_position("F", cost_basis=13.46, shares=100, entry_date="2026-07-09")
         db.log_capital("buy_shares", -1346.0, "F", "Acquisto 100az Ford @ $13.46")
 
-    # Registra il ciclo covered call F se non presente — idempotente come sopra.
-    # Necessario perche' il DB usato da GitHub Actions (persistito via cache) e'
-    # separato da quello locale: senza questo self-heal, un run schedulato su un
-    # cache "fresca" non vede mai un ciclo aperto solo tramite /open interattivo.
-    if not db.get_open_cycle("F"):
-        db.open_wheel_cycle(
-            ticker="F", strike=15.5, expiry="2026-08-21",
-            premium_received=0.23, phase="covered_call",
-        )
-        logger.info("Ciclo covered call F auto-registrato (strike 15.5, scad 2026-08-21)")
+    # NOTA: il ciclo covered call F (strike 15.5, scad 2026-08-21) e' stato
+    # chiuso il 10/08/2026 (buy-to-close @ $0.03, pnl $17.54) — un tempo qui
+    # c'era un auto-registrazione idempotente per sincronizzare il DB separato
+    # di GitHub Actions col DB locale, ma ora resusciterebbe un ciclo gia'
+    # chiuso. Rimossa. Prossimo ciclo da aprire manualmente via /open dopo
+    # l'ex-dividend dell'11/08, quando su questo DB restera' comunque assente
+    # finche' non verra' registrato allo stesso modo.
 
     db.seed_capital(1500.0)
 
