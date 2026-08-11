@@ -29,12 +29,21 @@ def run_wheel() -> None:
         db.upsert_position("F", cost_basis=13.46, shares=100, entry_date="2026-07-09")
         db.log_capital("buy_shares", -1346.0, "F", "Acquisto 100az Ford @ $13.46")
 
-    # NOTA: il ciclo covered call F (strike 15.5, scad 2026-08-21) e' stato
-    # chiuso il 10/08/2026 (buy-to-close @ $0.03, pnl $17.54) — un tempo qui
-    # c'era un auto-registrazione idempotente per sincronizzare il DB separato
-    # di GitHub Actions col DB locale, ma ora resusciterebbe un ciclo gia'
-    # chiuso. Rimossa. Prossimo ciclo da aprire manualmente via /open dopo
-    # l'ex-dividend dell'11/08, quando su questo DB restera' comunque assente
+    # Pulizia una tantum: il DB persistito via cache GitHub Actions e' separato
+    # da quello locale, quindi non ha mai visto il /close reale del 10/08 —
+    # continua a mandare advisory per un ciclo gia' chiuso su IBKR. Chiude
+    # qui il record fantasma se ancora presente (self-heal, non ripetibile
+    # per errore: agisce solo sull'esatta firma del ciclo noto).
+    _ghost = db.get_open_cycle("F")
+    if _ghost and float(_ghost["strike"]) == 15.5 and _ghost["expiry"] == "2026-08-21":
+        db.close_wheel_cycle(
+            _ghost["id"], pnl=17.54,
+            notes="Chiuso realmente il 10/08/2026 (buy-to-close @ $0.03) — "
+                  "self-heal cache GitHub Actions mai sincronizzata col DB locale",
+        )
+        logger.info("Ciclo fantasma F (strike 15.5) chiuso per allineare la cache GH Actions")
+
+    # Prossimo ciclo da aprire manualmente via /open dopo l'ex-dividend dell'11/08
     # finche' non verra' registrato allo stesso modo.
 
     db.seed_capital(1500.0)
