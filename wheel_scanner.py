@@ -54,6 +54,10 @@ class WheelScanResult:
     above_sma50: bool = True
     candidates_count: int = 0
     error: str | None = None
+    div_yield: float | None = None     # dividendYield da yfinance (es. 0.076 = 7.6%)
+    annual_div: float = 0.0            # dividendRate annuo per azione
+    ex_div_date: str | None = None     # prossima ex-dividend date ISO
+    div_in_dte_window: bool = False    # ex-div cade dentro il DTE della best_put
 
 
 # ── Funzione principale ────────────────────────────────────────────────────────
@@ -80,6 +84,17 @@ def scan_wheel_candidate(ticker: str) -> WheelScanResult | None:
 
         if not spot or spot <= 0:
             return WheelScanResult(ticker=ticker, error="prezzo non disponibile")
+
+        # ── Dividendo ─────────────────────────────────────────────────────────
+        div_yield  = _safe_float(info.get("dividendYield"))
+        annual_div = _safe_float(info.get("dividendRate")) or 0.0
+        ex_div_ts  = info.get("exDividendDate")
+        ex_div_date: str | None = None
+        if ex_div_ts:
+            try:
+                ex_div_date = datetime.fromtimestamp(ex_div_ts).date().isoformat()
+            except Exception:
+                pass
 
         # ── Dati storici per HV20 e SMA50 ────────────────────────────────────
         hist    = yf_obj.history(period="70d")
@@ -190,6 +205,13 @@ def scan_wheel_candidate(ticker: str) -> WheelScanResult | None:
             f"${best.strike:.0f} {best.expiry} {best.annualized_return:.1f}%" if best else "nessuno",
         )
 
+        div_in_dte_window = False
+        if ex_div_date and best:
+            try:
+                div_in_dte_window = date.fromisoformat(ex_div_date) <= date.fromisoformat(best.expiry)
+            except Exception:
+                pass
+
         return WheelScanResult(
             ticker=ticker,
             best_put=best,
@@ -200,6 +222,10 @@ def scan_wheel_candidate(ticker: str) -> WheelScanResult | None:
             next_earnings=next_earnings,
             above_sma50=above_sma50,
             candidates_count=len(candidates),
+            div_yield=div_yield,
+            annual_div=annual_div,
+            ex_div_date=ex_div_date,
+            div_in_dte_window=div_in_dte_window,
         )
 
     except Exception as exc:

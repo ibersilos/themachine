@@ -20,9 +20,12 @@ logger = logging.getLogger(__name__)
 _HEADERS = {"User-Agent": "Mozilla/5.0"}
 _FEED_URL = "https://seekingalpha.com/api/sa/combined/{ticker}.xml"
 
-# Pattern per estrarre un earnings surprise dal titolo, es:
-# "X GAAP EPS of -$0.22 misses by $0.12, revenue of $12.8M misses by $0.76M"
+# Pattern per estrarre un earnings surprise dal titolo
 _EPS_RE = re.compile(r"EPS of \$?(-?[\d.]+)\s+(misses|beats)\s+by\s+\$?([\d.]+)", re.IGNORECASE)
+
+# Pattern per rilevare articoli dividendo
+_DIV_RE     = re.compile(r"\b(dividend|yield|payout|declares?|distribution)\b", re.IGNORECASE)
+_DIV_CUT_RE = re.compile(r"\b(cut|cuts|reduce[sd]?|suspend[sed]?|eliminat[eding]+)\b.*\bdividend\b|\bdividend\b.*\b(cut|suspend|eliminat)", re.IGNORECASE)
 
 _cache: dict[str, tuple[float, dict]] = {}
 _CACHE_TTL = 3600  # 1h — le notizie non cambiano ogni minuto
@@ -52,6 +55,8 @@ def get_recent_news(ticker: str, max_items: int = 10) -> dict:
         "sa_latest_date": None,
         "sa_days_since_latest": None,
         "sa_eps_surprise": None,
+        "sa_div_mentioned": False,
+        "sa_div_cut": False,
     }
     if not ticker:
         return empty
@@ -86,12 +91,18 @@ def get_recent_news(ticker: str, max_items: int = 10) -> dict:
             pass
 
     eps_surprise = None
+    div_mentioned = False
+    div_cut = False
     for item in items:
         t = item.find("title").get_text(strip=True) if item.find("title") else ""
-        m = _EPS_RE.search(t)
-        if m:
-            eps_surprise = "beat" if m.group(2).lower() == "beats" else "miss"
-            break
+        if not eps_surprise:
+            m = _EPS_RE.search(t)
+            if m:
+                eps_surprise = "beat" if m.group(2).lower() == "beats" else "miss"
+        if _DIV_RE.search(t):
+            div_mentioned = True
+        if _DIV_CUT_RE.search(t):
+            div_cut = True
 
     result = {
         "sa_item_count": len(items),
@@ -99,6 +110,8 @@ def get_recent_news(ticker: str, max_items: int = 10) -> dict:
         "sa_latest_date": latest_date,
         "sa_days_since_latest": days_since,
         "sa_eps_surprise": eps_surprise,
+        "sa_div_mentioned": div_mentioned,
+        "sa_div_cut": div_cut,
     }
     _cache[ticker] = (time.time(), result)
     return result

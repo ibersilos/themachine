@@ -262,6 +262,13 @@ def _score_seeking_alpha(signal: dict) -> tuple[int, list[str]]:
         score += 15
         flags.append(f"SA: copertura attiva ({item_count} articoli)")
 
+    if signal.get("sa_div_cut"):
+        score = max(score - 30, 0)
+        flags.append("SA: possibile taglio dividendo")
+    elif signal.get("sa_div_mentioned"):
+        score += 10
+        flags.append("SA: articolo dividendo recente")
+
     return min(score, 100), flags
 
 
@@ -307,6 +314,14 @@ def _score_fundamentals(signal: dict) -> tuple[int, list[str]]:
         elif mom_1m < -0.15:
             score = max(score - 15, 0)
             flags.append(f"Momentum negativo (1m {mom_1m*100:+.0f}%)")
+
+    div_yield = signal.get("div_yield") or 0.0
+    if div_yield >= 0.05:
+        score += 20
+        flags.append(f"Div yield {div_yield*100:.1f}% (high)")
+    elif div_yield >= 0.02:
+        score += 10
+        flags.append(f"Div yield {div_yield*100:.1f}%")
 
     return max(min(score, 100), 0), flags
 
