@@ -25,10 +25,12 @@ _HEADERS = {
     "Accept-Encoding": "gzip, deflate",
 }
 
-# Insider roles that carry the strongest conviction signal — unambiguous,
-# always C-suite/board regardless of context.
-_HIGH_CONVICTION_ROLES = (
-    "chief executive officer", "ceo",
+# Insider roles che portano il segnale piu' forte — CEO isolato dal resto:
+# la letteratura sull'insider trading (Cohen/Malloy/Pomorski e affini) tratta
+# il CEO come il ruolo piu' informativo in assoluto, non equivalente a un
+# CFO/COO/Chairman (comunque forti, ma un gradino sotto).
+_CEO_ROLES = ("chief executive officer", "ceo")
+_SENIOR_ROLES = (
     "chief financial officer", "cfo",
     "chief operating officer", "coo",
     "chairman",
@@ -41,10 +43,14 @@ _GENERIC_SENIOR_ROLES = ("president", "director")
 _JUNIOR_TITLE_MODIFIERS = ("vice", "assistant", "associate", "deputy", "acting")
 
 
-def _is_high_conviction_title(title: str) -> bool:
+def _conviction_tier(title: str) -> str | None:
+    """Ritorna 'ceo' | 'senior' (CFO/COO/Chairman) | 'generic' (President/Director
+    non generico) | None (nessun ruolo ad alta conviction riconosciuto)."""
     t = title.lower()
-    if any(re.search(rf"\b{re.escape(role)}\b", t) for role in _HIGH_CONVICTION_ROLES):
-        return True
+    if any(re.search(rf"\b{re.escape(role)}\b", t) for role in _CEO_ROLES):
+        return "ceo"
+    if any(re.search(rf"\b{re.escape(role)}\b", t) for role in _SENIOR_ROLES):
+        return "senior"
     for generic in _GENERIC_SENIOR_ROLES:
         for m in re.finditer(rf"\b{generic}\b", t):
             prefix = t[:m.start()].rstrip()
@@ -53,8 +59,12 @@ def _is_high_conviction_title(title: str) -> bool:
                 continue  # "Vice President ...", "Assistant Director ..."
             if suffix.startswith("of "):
                 continue  # "Director of Engineering", "President of Sales"
-            return True
-    return False
+            return "generic"
+    return None
+
+
+def _is_high_conviction_title(title: str) -> bool:
+    return _conviction_tier(title) is not None
 
 _SEEN_ACCESSIONS: set[str] = set()
 
@@ -95,6 +105,7 @@ def _parse_form4_xml(xml_text: str) -> dict:
         "insider_name":          None,
         "insider_title":         None,
         "is_high_conviction":    False,
+        "conviction_tier":       None,   # 'ceo' | 'senior' | 'generic' | None
         "ownership_post":        None,
         "transaction_date":      None,
         "issuer_ticker":         None,
@@ -127,7 +138,9 @@ def _parse_form4_xml(xml_text: str) -> dict:
         if title_tag:
             title = title_tag.get_text(strip=True)
             result["insider_title"] = title
-            result["is_high_conviction"] = _is_high_conviction_title(title)
+            tier = _conviction_tier(title)
+            result["conviction_tier"] = tier
+            result["is_high_conviction"] = tier is not None
 
     # Non-derivative transactions (stock purchases/sales)
     for txn in soup.find_all("nonDerivativeTransaction"):

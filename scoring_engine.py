@@ -194,10 +194,17 @@ def _score_form4(signal: dict) -> tuple[int, list[str]]:
             score += 15
             flags.append(f"Purchase ${amount:,.0f}")
 
-        if signal.get("is_high_conviction"):
-            score += 20
+        # CEO pesa piu' di CFO/COO/Chairman, che pesano piu' di President/Director
+        # generico — letteratura insider trading: il CEO e' il ruolo con il
+        # contenuto informativo piu' alto in assoluto, non equivalente al resto
+        # del "high conviction" bucket. Proposto 27/08/2026, non ancora
+        # backtestato con dati sufficienti (vedi log regole in the-machine-analyst).
+        tier = signal.get("conviction_tier")
+        tier_bonus = {"ceo": 25, "senior": 20, "generic": 12}.get(tier, 0)
+        if tier_bonus:
+            score += tier_bonus
             title = signal.get("insider_title", "")
-            flags.append(f"High-conviction role ({title})")
+            flags.append(f"Conviction {tier} +{tier_bonus} ({title})")
 
         cluster = signal.get("insider_cluster_count", 0) or 0
         if cluster >= 2:
