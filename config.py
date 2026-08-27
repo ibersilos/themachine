@@ -33,6 +33,11 @@ DB_PATH: Path = Path(os.getenv("DB_PATH", "data/the_machine.db"))
 
 # Risk controls
 STOP_LOSS_PCT: float        = _float("STOP_LOSS_PCT", 0.15)
+# Disattivato di proposito (27/08/2026): la strategia e' comprare titoli che
+# si e' disposti a tenere per il dividendo — uno stop-loss a prezzo vende
+# proprio quando si vorrebbe tenere/mediare. Il controllo di rischio vero e'
+# _check_thesis_break() in wheel_daemon.py (taglio dividendo, non prezzo).
+PRICE_STOP_LOSS_ENABLED: bool = os.getenv("PRICE_STOP_LOSS_ENABLED", "false").lower() in ("1", "true", "yes")
 MAX_MONTHLY_DRAWDOWN: float = _float("MAX_MONTHLY_DRAWDOWN", 0.20)
 DRAWDOWN_PAUSE_DAYS: int    = _int("DRAWDOWN_PAUSE_DAYS", 30)
 
@@ -63,8 +68,41 @@ WHEEL_VRP_MIN:      float = _float("WHEEL_VRP_MIN",           1.1)  # VRP min (I
 WHEEL_DTE_MIN:          int   = _int("WHEEL_DTE_MIN",           14)   # DTE minimo
 WHEEL_DTE_MAX:          int   = _int("WHEEL_DTE_MAX",           42)   # DTE massimo
 WHEEL_MAX_SPREAD_PCT:   float = _float("WHEEL_MAX_SPREAD_PCT",  0.10) # max spread bid-ask %
-WHEEL_MIN_PREMIUM:      float = _float("WHEEL_MIN_PREMIUM",     0.30) # premio minimo $/contratto
+WHEEL_MAX_SPREAD_ABS:   float = _float("WHEEL_MAX_SPREAD_ABS",  0.05) # OPPURE spread assoluto $ max
+# — su opzioni a premio basso ($0.15-0.25) lo spread % esplode anche con
+# tick minimo del market maker (bid/ask $0.05 di differenza = 20-30%),
+# scartando opzioni con OI altissimo (es. PBR $17P: OI 9.518, spread $0.04
+# = "solo" percentuale alta). Passa se soddisfa la % OPPURE il $ assoluto.
+# Bug trovato 27/08/2026 verificando PBR sul chain reale.
+WHEEL_MIN_PREMIUM:      float = _float("WHEEL_MIN_PREMIUM",     0.10) # premio minimo $/contratto — solo
+# floor anti-rumore (evita mid quasi zero/illiquidi): la soglia economica
+# vera e' WHEEL_ANN_RETURN_MIN, che scala col prezzo. A $0.30 fisso
+# scartava opportunita' valide su titoli piu' cari di F (es. T, PBR con
+# ann.ret 15-22% ma premio assoluto $0.15-0.23) — bug trovato 27/08/2026.
 WHEEL_ANN_RETURN_MIN:   float = _float("WHEEL_ANN_RETURN_MIN",  15.0) # rendimento annualizzato min %
+
+# Selezione strike per delta (Black-Scholes) invece di banda fissa % dello
+# spot — si auto-adatta a IV/tempo residuo invece di ignorarli. Standard di
+# settore per CSP: delta 0.16-0.30 (~16-30% probabilita' di assegnazione).
+WHEEL_PUT_DELTA_MIN:    float = _float("WHEEL_PUT_DELTA_MIN",   0.16)
+WHEEL_PUT_DELTA_MAX:    float = _float("WHEEL_PUT_DELTA_MAX",   0.30)
+
+# ── Tier-1 universe — candidati wheel a capitale ridotto ─────────────────────
+# Criteri: prezzo $10-30 (lotto 100az abbordabile con capitale piccolo),
+# dividend yield >3%, market cap >$1B (liquidita' opzioni), sopra 200-SMA.
+# Screening manuale 27/08/2026 — dati vanno riverificati prima di ogni uso,
+# non e' uno screener live. PBR ha rischio EM/valuta/politico aggiuntivo
+# (Petrobras, statale brasiliana) — yield alto ma piu' volatile del gruppo.
+# Mortgage REIT ad alto yield (NLY, AGNC) esclusi di proposito: profilo di
+# rischio diverso (leva su mutui, erosione NAV nel tempo) da un dividend
+# grower — da aggiungere solo con scelta consapevole, non come default.
+WHEEL_TIER1_UNIVERSE: list[str] = [
+    "F",     # Ford — gia' in portafoglio
+    "T",     # AT&T — div 4.3%, liquidita' altissima
+    "PFE",   # Pfizer — div 6.2%
+    "KEY",   # KeyCorp — div 3.8%, banca regionale
+    "PBR",   # Petrobras — div 9.4%, rischio EM/valuta piu' alto del gruppo
+]
 
 # yfinance
 FUNDAMENTALS_CACHE_TTL: int = _int("FUNDAMENTALS_CACHE_TTL", 3600)

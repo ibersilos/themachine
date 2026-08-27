@@ -14,6 +14,10 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+# httpx a INFO logga l'URL completo delle richieste — l'API Telegram mette il
+# bot token nel path dell'URL (non in un header), quindi finirebbe in chiaro
+# nei log ad ogni sendMessage. WARNING basta, non serve mai vedere l'URL.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("run-once")
 
 

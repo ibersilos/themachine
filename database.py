@@ -135,6 +135,17 @@ def init_db() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_backtest_score  ON backtest_results(score);
         CREATE INDEX IF NOT EXISTS idx_backtest_source ON backtest_results(source);
+
+        -- Ultimo digest "scan universo" inviato — evita di rimandare lo
+        -- stesso alert ogni mattina se il miglior candidato non e' cambiato.
+        CREATE TABLE IF NOT EXISTS universe_scan_state (
+            id          INTEGER PRIMARY KEY CHECK (id = 1),
+            ticker      TEXT,
+            strike      REAL,
+            expiry      TEXT,
+            ann_return  REAL,
+            sent_at     TEXT
+        );
         """)
         # Migrazione: aggiungi colonna pipeline se non esiste (DB pre-dual-pipeline)
         try:
@@ -416,6 +427,31 @@ def seed_capital(amount: float) -> None:
         )
 
 
+def sync_capital_from_broker(real_cash: float, note: str = "") -> float:
+    """
+    Forza il balance a coincidere col cash reale IBKR (fonte di verità).
+
+    A differenza di log_capital() (delta incrementale — fragile: un trade
+    eseguito manualmente su IBKR senza passare da /open o /close disallinea
+    silenziosamente il ledger), questa funzione riallinea il balance al
+    valore reale e registra la differenza come evento "broker_sync" per
+    audit trail — non nasconde la discrepanza, la rende esplicita.
+    """
+    with tx() as conn:
+        row = conn.execute("SELECT balance FROM capital WHERE id=1").fetchone()
+        current = float(row["balance"]) if row else 0.0
+        diff = real_cash - current
+        conn.execute(
+            "UPDATE capital SET balance=?, updated_at=datetime('now') WHERE id=1",
+            (real_cash,),
+        )
+        conn.execute(
+            "INSERT INTO capital_log (event, amount, note, balance_after) VALUES (?,?,?,?)",
+            ("broker_sync", diff, note or f"Riallineato a cash reale IBKR ${real_cash:.2f} (diff ${diff:+.2f})", real_cash),
+        )
+    return real_cash
+
+
 def log_capital(event: str, amount: float, ticker: str | None = None,
                 note: str = "") -> float:
     """Aggiorna il balance e registra il movimento. Restituisce il nuovo balance."""
@@ -483,6 +519,51 @@ def upsert_backtest_result(signal_id: int, ticker: str, score: int | None,
              prices.get(5), prices.get(10), prices.get(20), prices.get(60),
              returns.get(5), returns.get(10), returns.get(20), returns.get(60)),
         )
+
+
+def get_last_universe_scan() -> dict | None:
+    row = _conn().execute("SELECT * FROM universe_scan_state WHERE id=1").fetchone()
+    return dict(row) if row else None
+
+
+def set_last_universe_scan(ticker: str, strike: float, expiry: str, ann_return: float) -> None:
+    with tx() as conn:
+        conn.execute(
+            """
+            INSERT INTO universe_scan_state (id, ticker, strike, expiry, ann_return, sent_at)
+            VALUES (1, ?, ?, ?, ?, datetime('now'))
+            ON CONFLICT(id) DO UPDATE SET
+                ticker=excluded.ticker, strike=excluded.strike, expiry=excluded.expiry,
+                ann_return=excluded.ann_return, sent_at=excluded.sent_at
+            """,
+            (ticker, strike, expiry, ann_return),
+        )
+
+
+def get_backtest_stats_for(source: str, min_score: int) -> dict:
+    """
+    Aggrega i ritorni realizzati per una fonte segnale con score >= min_score
+    (pool piu' ampio del bucket singolo di get_backtest_report — serve
+    massimizzare n per stimare l'edge "trading" quando si confronta con
+    l'annualized return del wheel su un segnale specifico).
+    """
+    row = _conn().execute(
+        """
+        SELECT
+            COUNT(*) AS n,
+            AVG(return_20d) AS avg_20d,
+            SUM(CASE WHEN return_20d > 0 THEN 1 ELSE 0 END) * 1.0
+                / NULLIF(SUM(CASE WHEN return_20d IS NOT NULL THEN 1 ELSE 0 END), 0) AS win_rate_20d
+        FROM backtest_results
+        WHERE source = ? AND score >= ?
+        """,
+        (source, min_score),
+    ).fetchone()
+    return {
+        "n": row["n"] or 0,
+        "avg_20d": float(row["avg_20d"]) if row["avg_20d"] is not None else None,
+        "win_rate_20d": float(row["win_rate_20d"]) if row["win_rate_20d"] is not None else None,
+    }
 
 
 def get_backtest_report() -> list:

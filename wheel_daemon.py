@@ -440,6 +440,115 @@ def _check_dividend_warnings(positions: list, open_cycles: list) -> None:
             logger.debug("Dividend check %s: %s", ticker, exc)
 
 
+# ── Rottura tesi (sostituisce lo stop-loss a prezzo) ─────────────────────────
+
+def _check_thesis_break(positions: list) -> None:
+    """
+    Controllo su rottura di tesi, non su prezzo. La strategia compra titoli
+    che si e' disposti a tenere per il dividendo (config.WHEEL_TIER1_UNIVERSE
+    curata apposta) — uno stop-loss a prezzo venderebbe proprio quando si
+    vorrebbe tenere/mediare. Il vero segnale di uscita e' "il motivo per cui
+    lo tengo non vale piu'": dividendo tagliato/sospeso.
+
+    Il check "nessun dividendo rilevato" gira solo sui ticker Tier-1 (scelti
+    apposta per il dividendo) — su posizioni stock-picking pure (es. ALTO,
+    SRI, mai state dividend play) darebbe falsi positivi permanenti.
+    """
+    from telegram_bot import send_alert
+    import seeking_alpha_feed
+
+    for pos in positions:
+        ticker = pos["ticker"]
+        try:
+            news = seeking_alpha_feed.get_recent_news(ticker)
+            if news.get("sa_div_cut"):
+                send_alert(
+                    f"🚨 *POSSIBILE TAGLIO DIVIDENDO — {ticker}*\n"
+                    f"Notizia: _{news.get('sa_latest_headline') or 'n/d'}_\n"
+                    f"La tesi per cui tieni questo titolo (dividendo) potrebbe essersi rotta — "
+                    f"verifica, non è un alert di prezzo."
+                )
+                continue
+
+            if ticker in config.WHEEL_TIER1_UNIVERSE:
+                t = _get_ticker(ticker)
+                ann_div = _annual_dividend(t)
+                if not ann_div:
+                    send_alert(
+                        f"⚠️ *DIVIDENDO NON RILEVATO — {ticker}*\n"
+                        f"Nessun dividend rate annuo riportato — verifica se è stato "
+                        f"sospeso (titolo Tier-1, scelto apposta per il dividendo)."
+                    )
+        except Exception as exc:
+            logger.debug("Thesis-break check %s: %s", ticker, exc)
+
+
+# ── Scan proattivo universo Tier-1 ────────────────────────────────────────────
+
+def _daily_universe_scan() -> None:
+    """
+    Rispetto a _check_cycle() (reattivo, sui cicli gia' aperti) e al confronto
+    in telegram_bot.dispatch_signal() (reattivo, sui nuovi segnali in arrivo),
+    questo scan e' proattivo: ogni mattina ripassa l'intero universo Tier-1
+    (config.WHEEL_TIER1_UNIVERSE) a prescindere da segnali, e propone il
+    miglior candidato non ancora aperto — "come se i soldi fossero nostri":
+    lettura dei dati, non previsione di mercato.
+    """
+    from telegram_bot import send_alert
+    import wheel_scanner as ws
+
+    open_tickers = {c["ticker"] for c in db.get_open_cycles()}
+    candidates = []
+
+    for ticker in config.WHEEL_TIER1_UNIVERSE:
+        if ticker in open_tickers:
+            continue
+        try:
+            r = ws.scan_wheel_candidate(ticker)
+            if r and r.best_put:
+                candidates.append((ticker, r.best_put, r.div_yield))
+        except Exception as exc:
+            logger.debug("Universe scan %s: %s", ticker, exc)
+
+    if not candidates:
+        logger.info("wheel_daemon: universe scan — nessun candidato Tier-1 valido oggi")
+        return
+
+    candidates.sort(key=lambda c: c[1].annualized_return, reverse=True)
+    best_ticker, best_put, div_yield = candidates[0]
+
+    # Dedup: manda l'alert solo se il candidato migliore e' cambiato in modo
+    # rilevante rispetto all'ultimo digest inviato — altrimenti e' rumore
+    # ripetuto ogni mattina che si finisce per ignorare dopo una settimana.
+    last = db.get_last_universe_scan()
+    ANN_RET_CHANGE_THRESHOLD = 2.0  # punti percentuali
+    changed = (
+        last is None
+        or last["ticker"] != best_ticker
+        or last["strike"] != best_put.strike
+        or last["expiry"] != best_put.expiry
+        or abs((last["ann_return"] or 0) - best_put.annualized_return) >= ANN_RET_CHANGE_THRESHOLD
+    )
+    if not changed:
+        logger.info("wheel_daemon: universe scan invariato (%s %.1f%%) — alert soppresso", best_ticker, best_put.annualized_return)
+        return
+
+    lines = [f"🔍 *SCAN UNIVERSO TIER-1 — {best_ticker} in testa*\n"]
+    lines.append(
+        f"Strike `${best_put.strike}` scad `{best_put.expiry}` (delta {best_put.delta}) — "
+        f"`{best_put.annualized_return:.1f}%/anno` annualizzato"
+        + (f", dividendo `{div_yield:.1f}%`" if div_yield else "")
+    )
+    if len(candidates) > 1:
+        others = ", ".join(f"{t} {p.annualized_return:.1f}%" for t, p, _ in candidates[1:4])
+        lines.append(f"Altri candidati: {others}")
+    lines.append(f"\nUsa `/open {best_ticker} CSP {best_put.strike} {best_put.expiry} {best_put.mid:.2f}` per registrarlo dopo l'esecuzione manuale su IBKR.")
+
+    send_alert("\n".join(lines))
+    db.set_last_universe_scan(best_ticker, best_put.strike, best_put.expiry, best_put.annualized_return)
+    logger.info("wheel_daemon: universe scan inviato — top %s (%.1f%%)", best_ticker, best_put.annualized_return)
+
+
 # ── Daily check ───────────────────────────────────────────────────────────────
 
 def _daily_check() -> None:
@@ -448,6 +557,11 @@ def _daily_check() -> None:
     logger.info("wheel_daemon: daily check avviato")
     open_cycles = db.get_open_cycles()
     positions   = db.get_all_positions()
+
+    try:
+        _daily_universe_scan()
+    except Exception as exc:
+        logger.error("_daily_universe_scan: %s", exc)
 
     if not open_cycles and not positions:
         logger.info("wheel_daemon: nessun ciclo aperto e nessuna posizione tracciata")
@@ -460,6 +574,7 @@ def _daily_check() -> None:
             logger.error("_check_cycle %s: %s", cycle["ticker"], exc)
 
     _check_dividend_warnings(positions, open_cycles)
+    _check_thesis_break(positions)
 
 
 def _weekly_report() -> None:

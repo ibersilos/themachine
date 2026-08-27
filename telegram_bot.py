@@ -287,6 +287,19 @@ def dispatch_signal(bd: ScoreBreakdown, signal: dict) -> None:
         return
 
     msg = _format_signal_alert(bd, signal)
+
+    # Confronto wheel vs trading direzionale — solo sui tier azionabili
+    # (BUY ALERT/STRONG BUY), per non pagare uno scan opzioni live su ogni
+    # WATCH scartabile. "Come se i soldi fossero nostri": confronto basato
+    # su dati storici reali (backtest_engine), non previsioni.
+    if bd.tier() != "WATCH" and bd.ticker:
+        try:
+            import strategy_advisor
+            cmp = strategy_advisor.compare(bd.ticker, signal.get("source", ""), bd.total)
+            msg += f"\n\n---\n*Wheel vs Trading:*\n{cmp.format()}"
+        except Exception as exc:
+            logger.warning("strategy_advisor.compare fallito per %s: %s", bd.ticker, exc)
+
     send_alert(msg)
 
     sig_id = signal.get("_db_id")

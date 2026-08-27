@@ -21,10 +21,22 @@ from datetime import date, datetime
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from scipy.stats import norm
 
 import config
 
 logger = logging.getLogger(__name__)
+
+RISK_FREE_RATE = 0.05
+
+
+def _bs_put_delta(spot: float, strike: float, dte: int, iv: float) -> float | None:
+    """Delta Black-Scholes di una put (valore assoluto, 0-1). None se input invalidi."""
+    if spot <= 0 or strike <= 0 or dte <= 0 or iv <= 0:
+        return None
+    T = dte / 365.0
+    d1 = (np.log(spot / strike) + (RISK_FREE_RATE + 0.5 * iv**2) * T) / (iv * np.sqrt(T))
+    return abs(norm.cdf(d1) - 1)
 
 
 @dataclass
@@ -40,6 +52,7 @@ class PutCandidate:
     volume: int
     spread_pct: float     # (ask-bid)/mid
     annualized_return: float  # (mid/strike)*(365/dte)*100
+    delta: float | None = None  # |delta| Black-Scholes (probabilita' di assegnazione approx)
 
 
 @dataclass
@@ -153,14 +166,25 @@ def scan_wheel_candidate(ticker: str) -> WheelScanResult | None:
                 spread_pct = (ask - bid) / mid if mid > 0 else 1.0
                 ann_ret    = (mid / strike) * (365 / dte) * 100 if dte > 0 else 0.0
 
-                # Solo put OTM: CSP = vendere sotto mercato (strike 75%-100% di spot)
-                if strike >= spot * 1.01 or strike < spot * 0.75:
+                # Solo put OTM (CSP = vendere sotto mercato)
+                if strike >= spot * 1.01:
+                    continue
+
+                # Selezione per delta Black-Scholes invece di banda fissa % dello
+                # spot: si adatta a IV/tempo residuo invece di ignorarli. Standard
+                # CSP: delta 0.16-0.30 (~16-30% probabilita' di assegnazione).
+                delta = _bs_put_delta(spot, strike, dte, iv) if iv > 0 else None
+                if delta is None or not (config.WHEEL_PUT_DELTA_MIN <= delta <= config.WHEEL_PUT_DELTA_MAX):
                     continue
 
                 # Tier 1: hard filters (wheel-scout)
                 if oi > 0 and oi < config.WHEEL_OI_MIN:
                     continue
-                if spread_pct > config.WHEEL_MAX_SPREAD_PCT:
+                # Passa se soddisfa la % OPPURE lo spread assoluto in $ — su
+                # opzioni a premio basso il tick minimo del market maker fa
+                # esplodere lo spread % anche con OI molto alto.
+                spread_abs = ask - bid
+                if spread_pct > config.WHEEL_MAX_SPREAD_PCT and spread_abs > config.WHEEL_MAX_SPREAD_ABS:
                     continue
 
                 # Tier 2: profitability (wheel-scout)
@@ -179,6 +203,7 @@ def scan_wheel_candidate(ticker: str) -> WheelScanResult | None:
                     open_interest=oi, volume=vol,
                     spread_pct=spread_pct,
                     annualized_return=round(ann_ret, 2),
+                    delta=round(delta, 3),
                 ))
 
         # ── VRP (logica stockpile) ────────────────────────────────────────────

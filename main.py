@@ -34,6 +34,9 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+# httpx a INFO logga l'URL completo — il bot token Telegram e' nel path
+# dell'URL, non in un header, quindi finirebbe in chiaro ad ogni sendMessage.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger("the-machine")
 
 _signal_queue: queue.Queue = queue.Queue()

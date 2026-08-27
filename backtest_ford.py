@@ -16,13 +16,21 @@ warnings.filterwarnings("ignore")
 TICKER         = "F"
 BACKTEST_YEARS = 5
 TARGET_DTE     = 20
-OTM_PCT        = 0.03    # strike +3% OTM per CC, -3% per CSP
+# Selezione strike per delta Black-Scholes (0.16-0.30 standard CSP, qui il
+# punto medio 0.25) invece di banda fissa % dello spot — coerente con
+# wheel_scanner.py, cosi' il backtest valida la logica che gira davvero.
+TARGET_DELTA   = 0.30
 EARLY_CLOSE    = 0.50
 DTE_RULE       = 21
 MAX_ROLLS      = 2
 RISK_FREE      = 0.05
 SHARES         = 100
-COMMISSION     = 1.0     # $/ordine (IBKR, minimo per opzioni singole)
+# IBKR Tiered (passato da Fixed): niente minimo $1/ordine, ma costo per
+# contratto piu' alto a basso volume mensile — un conto piccolo che tratta
+# 1 contratto a botta resta nello scaglione piu' caro (~$0.65/contratto +
+# ~$0.05-0.10 fee regolamentari ORF/OCC). Stima, non dato dallo statement:
+# verificare col report Activity Fees IBKR per la cifra esatta.
+COMMISSION     = 0.70    # $/ordine (1 contratto, scaglione Tiered piu' basso)
 
 
 def bs_call(S, K, T, r, sigma):
@@ -51,6 +59,16 @@ def precompute_hv20(prices, window=20):
 def round_ford_strike(x):
     """Ford si scambia in incrementi di $0.50."""
     return round(x * 2) / 2
+
+
+def strike_for_delta(S, T, r, sigma, target_delta, right):
+    """Inverte la formula del delta Black-Scholes per trovare lo strike che
+    produce target_delta (0-1). right: 'call' o 'put'."""
+    if T <= 0 or sigma <= 0:
+        return S
+    d1 = norm.ppf(target_delta) if right == "call" else -norm.ppf(target_delta)
+    K = S * math.exp((r + 0.5 * sigma**2) * T - d1 * sigma * math.sqrt(T))
+    return K
 
 
 def main():
@@ -102,10 +120,10 @@ def main():
         T          = TARGET_DTE / 365.0
 
         if phase == "cc":
-            K         = round_ford_strike(S * (1 + OTM_PCT))
+            K         = round_ford_strike(strike_for_delta(S, T, RISK_FREE, vol, TARGET_DELTA, "call"))
             prem_open = bs_call(S, K, T, RISK_FREE, vol)
         else:
-            K         = round_ford_strike(S * (1 - OTM_PCT))
+            K         = round_ford_strike(strike_for_delta(S, T, RISK_FREE, vol, TARGET_DELTA, "put"))
             prem_open = bs_put(S, K, T, RISK_FREE, vol)
 
         expiry_date = entry_date + timedelta(days=TARGET_DTE)
@@ -177,8 +195,8 @@ def main():
 
             # Roll CC se stock sale verso strike
             if phase == "cc" and S_i > K * 0.97 and dte > 7 and roll_count < MAX_ROLLS:
-                new_K    = round_ford_strike(S_i * (1 + OTM_PCT))
                 new_T    = (TARGET_DTE + dte) / 365.0
+                new_K    = round_ford_strike(strike_for_delta(S_i, new_T, RISK_FREE, vol_i, TARGET_DELTA, "call"))
                 new_prem = bs_call(S_i, new_K, new_T, RISK_FREE, vol_i)
                 net_cr   = new_prem - prem_now
                 if net_cr > 0:

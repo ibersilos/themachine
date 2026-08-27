@@ -413,6 +413,33 @@ class IBKRConnector:
             except Exception as exc:
                 result.errors.append(f"sync stock {s.ticker}: {exc}")
 
+        # ── 1b. Stop loss a prezzo su ogni posizione azionaria — disattivato di
+        # default (config.PRICE_STOP_LOSS_ENABLED=False, 27/08/2026): la
+        # strategia compra titoli che si e' disposti a tenere per il
+        # dividendo, uno stop a prezzo venderebbe proprio quando si vorrebbe
+        # tenere. Il controllo di rischio vero e' su rottura di tesi (taglio
+        # dividendo) — vedi wheel_daemon._check_thesis_break().
+        if config.PRICE_STOP_LOSS_ENABLED:
+            stock_conids = [s.conid for s in stocks if s.conid]
+            stock_snap   = self._cp.get_market_snapshot(stock_conids) if stock_conids else {}
+
+            for s in stocks:
+                try:
+                    entry_row   = db.get_position(s.ticker)
+                    entry_price = float(entry_row["entry_price"]) if entry_row else s.avg_cost
+                    stock_mid   = stock_snap.get(s.conid, {}).get("mid") or 0
+                    if stock_mid and entry_price:
+                        pnl_pct = (stock_mid - entry_price) / entry_price
+                        if pnl_pct <= -config.STOP_LOSS_PCT:
+                            logger.warning("STOP LOSS: %s @ $%.2f (entry $%.2f, %.1f%%)",
+                                           s.ticker, stock_mid, entry_price, pnl_pct * 100)
+                            result.stop_orders.append(s.ticker)
+                            # Level 1: alert solo via Telegram (nessun ordine automatico)
+                            from telegram_bot import check_stop_loss
+                            check_stop_loss(s.ticker, entry_price, stock_mid)
+                except Exception as exc:
+                    result.errors.append(f"stop-loss check {s.ticker}: {exc}")
+
         # ── 2. Aggiorna premium_current dalle opzioni live ───────────────────
         if short_opt:
             conids = [p.conid for p in short_opt if p.conid]
@@ -444,22 +471,6 @@ class IBKRConnector:
                                 ticker, strike, expiry, mid)
 
                 result.synced.append(f"{ticker} {opt.right} ${strike} {expiry}")
-
-                # Stop loss check
-                stock = next((s for s in stocks if s.ticker == ticker), None)
-                if stock:
-                    entry_row = db.get_position(ticker)
-                    entry_price = float(entry_row["entry_price"]) if entry_row else opt.avg_cost
-                    stock_mid = snap.get(stock.conid, {}).get("mid") or 0
-                    if stock_mid and entry_price:
-                        pnl_pct = (stock_mid - entry_price) / entry_price
-                        if pnl_pct <= -config.STOP_LOSS_PCT:
-                            logger.warning("STOP LOSS: %s @ $%.2f (entry $%.2f, %.1f%%)",
-                                           ticker, stock_mid, entry_price, pnl_pct * 100)
-                            result.stop_orders.append(ticker)
-                            # Level 1: alert solo via Telegram (nessun ordine automatico)
-                            from telegram_bot import check_stop_loss
-                            check_stop_loss(ticker, entry_price, stock_mid)
 
             except Exception as exc:
                 result.errors.append(f"sync opt {opt.ticker}: {exc}")
