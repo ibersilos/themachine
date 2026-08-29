@@ -952,7 +952,9 @@ class HogueOptimizer:
                 f"IV Rank: `{iv_rank:.0f}%` | Strike CC: `${next_cc['strike']:.0f}` | Premio: `${next_cc['premium']:.2f}`/mese"
             )
 
-        lines.append(f"\n🛑 Stop loss automatico: `${stop_loss_price:.2f}` (-{config.STOP_LOSS_PCT*100:.0f}%)")
+        # Nota: solo riferimento informativo, nessun ordine automatico — lo
+        # stop-loss a prezzo e' disattivato di default (config.PRICE_STOP_LOSS_ENABLED)
+        lines.append(f"\nℹ️ Riferimento -{config.STOP_LOSS_PCT*100:.0f}%: `${stop_loss_price:.2f}` (nessun ordine automatico)")
 
         return "\n".join(lines)
 

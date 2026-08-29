@@ -96,7 +96,19 @@ def _maybe_export_to_drive() -> None:
 
 
 def _stop_loss_watcher() -> None:
-    """Background thread: checks open positions against live prices every 5 min."""
+    """
+    Background thread: checks open positions against live prices every 5 min.
+
+    Disattivato di default (config.PRICE_STOP_LOSS_ENABLED=False, 27/08/2026):
+    la strategia compra titoli che si e' disposti a tenere (dividendo, o in
+    diluizione come EXUS) — uno stop a prezzo venderebbe proprio quando si
+    vorrebbe tenere/mediare. Era gia' stato disattivato in ibkr_connector.py,
+    ma questo watcher indipendente lo bypassava (bug trovato 29/08/2026 —
+    EXUS continuava a triggerare nonostante il flag).
+    """
+    if not config.PRICE_STOP_LOSS_ENABLED:
+        logger.info("Stop-loss watcher: disattivato (config.PRICE_STOP_LOSS_ENABLED=False)")
+        return
     while True:
         try:
             conn = db._conn()
