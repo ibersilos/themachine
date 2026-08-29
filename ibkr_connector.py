@@ -41,6 +41,16 @@ import database as db
 
 logger = logging.getLogger(__name__)
 
+# Contatore di rifiuti consecutivi per ciclo (update_wheel_premium respinge
+# valori implausibili — vedi database.py) — un feed IBKR bloccato/sbagliato
+# per ore altrimenti resta invisibile, solo un warning nei log che nessuno
+# legge. Dopo _PREMIUM_REJECT_ALERT_THRESHOLD rifiuti di fila per lo stesso
+# ciclo, un singolo alert Telegram (non ripetuto ad ogni sync). Trovato in
+# produzione 30/08/2026 — il feed scriveva $217,68/$14,55 per decine di sync
+# consecutivi prima che qualcuno se ne accorgesse controllando /income.
+_PREMIUM_REJECT_ALERT_THRESHOLD = 10  # ~10 minuti a 60s/sync
+_premium_reject_counts: dict[int, int] = {}
+
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -520,7 +530,22 @@ class IBKRConnector:
                     # Ciclo non presente nel DB → crea automaticamente
                     logger.info("Opzione IBKR non in DB: %s %s $%.1f %s — registro",
                                 ticker, opt.right, strike, expiry)
-                    prem = snap.get(opt.conid, {}).get("mid") or abs(opt.avg_cost)
+                    # IBKR avg_cost per le opzioni include gia' il moltiplicatore
+                    # x100 (per contratto, non per azione) — usarlo come fallback
+                    # senza dividerlo scriverebbe un premio ~100x troppo alto come
+                    # base del ciclo (stessa famiglia di bug del premium_current
+                    # sballato trovata in produzione 30/08/2026, ma qui alla
+                    # NASCITA del ciclo, non solo nell'aggiornamento — mai passata
+                    # dalla guardia di plausibilita' di update_wheel_premium()).
+                    mid_snap = snap.get(opt.conid, {}).get("mid")
+                    prem = mid_snap if mid_snap else abs(opt.avg_cost) / 100
+                    if prem <= 0 or prem > strike:
+                        logger.warning(
+                            "Opzione IBKR %s %s $%.1f %s: premio implausibile (%.2f, strike %.2f) — "
+                            "registrazione automatica saltata, registrare a mano con /open",
+                            ticker, opt.right, strike, expiry, prem, strike,
+                        )
+                        continue
                     db.open_wheel_cycle(ticker, strike, expiry, prem, phase)
                     result.synced.append(f"{ticker} {opt.right} ${strike} {expiry} (nuovo)")
                     continue
@@ -528,9 +553,26 @@ class IBKRConnector:
                 # Aggiorna premium live
                 mid = snap.get(opt.conid, {}).get("mid")
                 if mid is not None and mid > 0:
-                    db.update_wheel_premium(cycle["id"], mid)
-                    logger.info("Premium aggiornato: %s $%.1f %s → $%.3f",
-                                ticker, strike, expiry, mid)
+                    ok = db.update_wheel_premium(cycle["id"], mid)
+                    if ok:
+                        _premium_reject_counts.pop(cycle["id"], None)
+                        logger.info("Premium aggiornato: %s $%.1f %s → $%.3f",
+                                    ticker, strike, expiry, mid)
+                    else:
+                        n = _premium_reject_counts.get(cycle["id"], 0) + 1
+                        _premium_reject_counts[cycle["id"]] = n
+                        if n == _PREMIUM_REJECT_ALERT_THRESHOLD:
+                            try:
+                                from telegram_bot import send_alert
+                                send_alert(
+                                    f"⚠️ *Feed opzioni IBKR sospetto — {ticker}*\n"
+                                    f"Il sync sta scartando da {n} tentativi consecutivi un premio "
+                                    f"implausibile per {ticker} ${strike:.1f} scad {expiry} "
+                                    f"(ultimo tentativo: ${mid:.2f}). `/income` mostra l'ultimo valore "
+                                    f"valido, non aggiornato. Verifica il Client Portal Gateway."
+                                )
+                            except Exception as alert_exc:
+                                logger.error("Alert feed sospetto fallito: %s", alert_exc)
 
                 result.synced.append(f"{ticker} {opt.right} ${strike} {expiry}")
 

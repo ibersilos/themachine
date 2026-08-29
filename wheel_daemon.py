@@ -45,12 +45,23 @@ _last_weekly_report: Optional[date] = None
 # ── Dividend helpers ──────────────────────────────────────────────────────────
 
 def _next_ex_div(ticker_obj: yf.Ticker) -> Optional[date]:
-    """Restituisce la prossima ex-dividend date da yfinance fast_info."""
+    """Restituisce la prossima ex-dividend date REALE (nel futuro).
+
+    Bug trovato in produzione 30/08/2026 su PBR: `info["exDividendDate"]`
+    di yfinance e' spesso l'ULTIMA ex-div gia' passata (specialmente subito
+    dopo che e' avvenuta, prima che yfinance aggiorni al prossimo evento
+    dichiarato), non necessariamente una data futura — veniva ritornata
+    senza controllare se fosse davvero nel futuro, mostrando su `/income`
+    "dividendo atteso" con una data gia' passata di giorni. Il fallback
+    correttamente filtrato su date future (sotto) esisteva gia' ma non
+    veniva mai raggiunto perche' il primo ramo aveva sempre successo."""
     try:
         info = ticker_obj.info
         ts = info.get("exDividendDate")
         if ts:
-            return datetime.fromtimestamp(ts).date()
+            d = datetime.fromtimestamp(ts).date()
+            if d >= date.today():
+                return d
     except Exception:
         pass
     try:
@@ -281,9 +292,14 @@ def _fmt_weekly_report(positions: list, year: int, month: int) -> str:
                 f"catturato `${pnl_open:.2f}` finora"
             )
 
-    # Dividendi attesi
+    # Dividendi attesi — esclude i ticker PAC (VWCE/EXUS), non fanno parte
+    # del bucket wheel e yfinance non li risolve comunque (ticker UCITS,
+    # "Quote not found" — trovato in produzione 30/08/2026 insieme al bug
+    # della data ex-div passata).
     div_lines = []
     for pos in positions:
+        if pos["ticker"] in config.PAC_EXCLUDE_TICKERS:
+            continue
         try:
             t = _get_ticker(pos["ticker"])
             ex_div = _next_ex_div(t)

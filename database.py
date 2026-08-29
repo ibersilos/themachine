@@ -310,12 +310,36 @@ def open_wheel_cycle(
         return cur.lastrowid
 
 
-def update_wheel_premium(cycle_id: int, premium_current: float) -> None:
+def update_wheel_premium(cycle_id: int, premium_current: float) -> bool:
+    """Aggiorna il premio corrente di un ciclo — con una guardia di
+    plausibilita' prima di scrivere. Trovato in produzione 30/08/2026: il
+    sync IBKR (`ibkr_connector.py`) scriveva ripetutamente $217,68 per una
+    CC PBR strike $19 e $14,55 per una CC F strike $14,5 — valori identici
+    per decine di sync consecutivi (mai variano col mercato reale), quasi
+    certamente uno snapshot IBKR sbagliato/di uno strumento diverso, non un
+    vero premio opzione. Un premio implausibile scritto in silenzio non
+    corrompe solo `/income` (visibile) ma anche `check_early_close()` e
+    `check_roll_opportunity()`, che decidono azioni di advisory reali sulla
+    base di questo valore — un dato sporco li' e' un rischio operativo, non
+    solo cosmetico. Regola: un premio opzione per una CC/CSP di questo
+    bucket non supera mai realisticamente lo strike stesso — se lo strike
+    del ciclo e' noto e il valore lo sfonda, si scarta con un warning
+    invece di scrivere dato spazzatura."""
+    row = _conn().execute("SELECT strike FROM wheel_cycles WHERE id=?", (cycle_id,)).fetchone()
+    strike = float(row["strike"]) if row and row["strike"] is not None else None
+    if premium_current <= 0 or (strike and premium_current > strike):
+        import logging
+        logging.getLogger(__name__).warning(
+            "update_wheel_premium: valore implausibile scartato — cycle_id=%s premium=%.3f strike=%s",
+            cycle_id, premium_current, strike,
+        )
+        return False
     with tx() as conn:
         conn.execute(
             "UPDATE wheel_cycles SET premium_current=? WHERE id=?",
             (premium_current, cycle_id),
         )
+    return True
 
 
 def close_wheel_cycle(cycle_id: int, pnl: float, notes: str = "") -> None:
