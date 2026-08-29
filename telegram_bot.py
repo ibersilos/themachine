@@ -55,14 +55,18 @@ def check_stop_loss(ticker: str, entry_price: float, current_price: float) -> bo
     return False
 
 
-def check_monthly_drawdown(delta_pct: float) -> None:
+def check_monthly_drawdown() -> None:
     """
-    Updates monthly PnL and auto-pauses the bot for DRAWDOWN_PAUSE_DAYS
-    if MAX_MONTHLY_DRAWDOWN is breached.
+    Ricalcola il P&L reale del mese corrente (db.get_monthly_realized_pnl_pct,
+    da capital_log — non piu' un contatore incrementale mai resettato a inizio
+    mese, kill-switch mai davvero utilizzabile prima) e mette in pausa il bot
+    se sfonda MAX_MONTHLY_DRAWDOWN. Va chiamata una volta al giorno dal daily
+    check (wheel_daemon._daily_check) — trovato mai invocata da nessuna parte
+    in deep audit 29/08/2026, backlog #5.
     """
-    db.update_monthly_pnl(delta_pct)
-    state = db.get_risk_state()
-    monthly_pnl = state["monthly_pnl_pct"]
+    if db.is_paused():
+        return  # gia' in pausa — non ri-allertare ogni giorno
+    monthly_pnl = db.get_monthly_realized_pnl_pct()
 
     if monthly_pnl <= -config.MAX_MONTHLY_DRAWDOWN:
         pause_until = datetime.utcnow() + timedelta(days=config.DRAWDOWN_PAUSE_DAYS)
@@ -578,6 +582,8 @@ async def _cmd_suggest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     result = wheel_daemon.suggest_next_cycle(ticker, phase)
     msg    = wheel_daemon._fmt_suggest(result)
+    if db.is_paused():
+        msg = "⏸️ *Kill-switch attivo (drawdown mensile)* — analisi comunque mostrata, valuta con più cautela del solito.\n\n" + msg
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 
@@ -832,7 +838,12 @@ async def _cmd_dividend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def _cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = db.get_risk_state()
     paused = db.is_paused()
-    monthly_pnl = state["monthly_pnl_pct"] * 100
+    # Ricalcolato da capital_log (db.get_monthly_realized_pnl_pct), non piu'
+    # letto da risk_state.monthly_pnl_pct — quel contatore non veniva mai
+    # aggiornato (check_monthly_drawdown non era mai invocata), quindi /status
+    # mostrava sempre 0% anche con un kill-switch di fatto inattivo. Trovato
+    # in deep audit 29/08/2026, backlog #5.
+    monthly_pnl = db.get_monthly_realized_pnl_pct() * 100
 
     pause_info = ""
     if paused:

@@ -108,7 +108,9 @@ def get_status() -> dict:
             "active": not paused,
             "paused": paused,
             "paused_until": risk.get("paused_until"),
-            "monthly_pnl_pct": round(float(risk.get("monthly_pnl_pct") or 0), 4),
+            # Ricalcolato da capital_log, non piu' letto dal contatore mai
+            # aggiornato risk_state.monthly_pnl_pct (deep audit 29/08/2026).
+            "monthly_pnl_pct": round(db.get_monthly_realized_pnl_pct(), 4),
             "last_signal_ago": _poll_age_str(_last_signal_ts),
             "last_signal_ts": _last_signal_ts,
             "signals_today": _signal_count_today,
@@ -129,7 +131,7 @@ def get_risk() -> dict:
     """Risk state dettagliato."""
     try:
         risk = _row_to_dict(db.get_risk_state())
-        dd = float(risk.get("monthly_pnl_pct") or 0)
+        dd = db.get_monthly_realized_pnl_pct()  # ricalcolato da capital_log — vedi /api/status
         return {
             "drawdown_pct":       round(dd, 4),
             "drawdown_display":   f"{dd*100:+.1f}%",

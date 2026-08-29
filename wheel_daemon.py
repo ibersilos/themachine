@@ -404,12 +404,12 @@ def _check_cycle(cycle_row) -> None:
         logger.info("Advisory CLOSE inviato: %s %s", ticker, expiry_str)
         return
 
-    # check_roll_opportunity() e' logica solo-covered-call (roll up-and-out via
-    # catena call, trigger stock>strike*pct) — applicata prima anche alle CSP
-    # con la direzione invertita: su una put ITM reale poteva sopprimere un
-    # roll difensivo necessario, o proporre "vendi una call" su una posizione
-    # short-put. Gate a covered_call finche' non esiste un roll down-and-out
-    # dedicato per le CSP (backlog — trovato in deep audit 29/08/2026).
+    # check_roll_opportunity() (CC) e check_roll_opportunity_put() (CSP) sono
+    # ora due funzioni simmetriche e distinte — prima girava solo la logica CC
+    # anche sulle CSP con la direzione invertita (poteva sopprimere un roll
+    # difensivo necessario, o proporre "vendi una call" su una short-put).
+    # Roll down-and-out per le CSP implementato in deep audit 29/08/2026,
+    # backlog #11.
     if phase == "covered_call":
         roll_action = _opt.check_roll_opportunity(position)
         if roll_action.action == "roll":
@@ -440,22 +440,36 @@ def _check_cycle(cycle_row) -> None:
             )
             send_alert(msg)
             return
-    elif phase == "csp" and stock_price and stock_price <= strike * 0.97:
-        # Nessun roll down-and-out automatico ancora implementato per le CSP
-        # (vedi commento sopra) — segnala solo il rischio, decisione manuale.
-        msg = _fmt_advisory(
-            cycle_row,
-            action_str="CSP MINACCIATA — valuta roll manuale o assegnazione",
-            detail=(
-                f"Stock ${stock_price:.2f} sotto strike ${strike:.1f}. Nessun roll automatico "
-                f"disponibile per le CSP (solo per le CC) — valuta tu se rollare a strike "
-                f"inferiore/scadenza successiva su IBKR, o lasciare assegnare (poi `/open {ticker} CC` "
-                f"per il prossimo ciclo, azioni comprate a ${strike:.1f})."
-            ),
-            urgency="normal",
-        )
-        send_alert(msg)
-        return
+    else:  # csp
+        roll_action = _opt.check_roll_opportunity_put(position)
+        if roll_action.action == "roll":
+            d = roll_action.details
+            msg = _fmt_advisory(
+                cycle_row,
+                action_str=f"ROLL DOWN-AND-OUT — strike ${d['new_strike']:.0f} scad {d['new_expiry']}",
+                detail=(
+                    f"1) Ricompra CSP ${strike:.1f} a ${d['cost_to_close']:.2f}\n"
+                    f"2) Vendi CSP ${d['new_strike']:.0f} scad {d['new_expiry']} a ${d['new_premium']:.2f}\n"
+                    f"Credito netto: ${d['net_credit']:.2f} (roll #{d['roll_number']}/{config.HOGUE_MAX_ROLLS})"
+                ),
+                urgency="normal",
+            )
+            send_alert(msg)
+            return
+
+        if roll_action.action == "assigned":
+            msg = _fmt_advisory(
+                cycle_row,
+                action_str="LASCIA ASSEGNARE — max roll raggiunto o roll a debito",
+                detail=(
+                    f"Stock ${stock_price:.2f} < strike ${strike:.1f}. "
+                    f"Azioni comprate a ${strike:.1f} + premio ${prem_recv:.2f} incassato. "
+                    f"Poi usa /open {ticker} CC per il prossimo ciclo."
+                ),
+                urgency="normal",
+            )
+            send_alert(msg)
+            return
 
     # Collar check
     collar = _opt.calculate_collar(position, stock_price)
@@ -663,9 +677,23 @@ def _daily_check() -> None:
         logger.error("_sync_capital_ledger: %s", exc)
 
     try:
-        _daily_universe_scan()
+        from telegram_bot import check_monthly_drawdown
+        check_monthly_drawdown()
     except Exception as exc:
-        logger.error("_daily_universe_scan: %s", exc)
+        logger.error("check_monthly_drawdown: %s", exc)
+
+    # Kill-switch attivo: niente nuovi suggerimenti di ciclo — le posizioni
+    # gia' aperte restano comunque monitorate/difese sotto (early close/roll/
+    # assegnazione), il kill-switch blocca solo l'apertura di nuovo rischio.
+    # check_monthly_drawdown()/_daily_universe_scan() erano scritte ma mai
+    # collegate — trovato in deep audit 29/08/2026, backlog #5.
+    if db.is_paused():
+        logger.info("wheel_daemon: bot in pausa (drawdown mensile) — scan universo saltato")
+    else:
+        try:
+            _daily_universe_scan()
+        except Exception as exc:
+            logger.error("_daily_universe_scan: %s", exc)
 
     if not open_cycles and not positions:
         logger.info("wheel_daemon: nessun ciclo aperto e nessuna posizione tracciata")

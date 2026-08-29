@@ -188,12 +188,47 @@ def set_pause(until: datetime) -> None:
         )
 
 
-def update_monthly_pnl(delta_pct: float) -> None:
-    with tx() as conn:
-        conn.execute(
-            "UPDATE risk_state SET monthly_pnl_pct = monthly_pnl_pct + ? WHERE id=1",
-            (delta_pct,),
-        )
+def _current_bucket_capital_estimate() -> float:
+    """Capitale reale approssimato del bucket wheel: cash reale
+    (capital.balance) + valore a costo delle posizioni wheel
+    (positions.entry_price*shares, esclusi i ticker PAC
+    config.PAC_EXCLUDE_TICKERS). Non e' mark-to-market (usa il prezzo di
+    carico, non quello corrente) ma e' molto piu' vicino alla realta' di
+    capital.seed, che resta fisso all'iniezione iniziale e non si aggiorna
+    mai per capitale nuovo entrato dopo (es. acquisto PBR 27/08 finanziato
+    da liquidazione Binance, mai registrato come iniezione — seed risultava
+    2,25x sotto il capitale reale del bucket, kill-switch scattava a ~9% di
+    perdita invece del 20% inteso). Trovato in verifica finale 29/08/2026."""
+    cash = float(get_capital()["balance"] or 0)
+    rows = _conn().execute("SELECT ticker, entry_price, shares FROM positions").fetchall()
+    stock_value = sum(
+        float(r["entry_price"] or 0) * float(r["shares"] or 0)
+        for r in rows if r["ticker"] not in config.PAC_EXCLUDE_TICKERS
+    )
+    return cash + stock_value
+
+
+def get_monthly_realized_pnl_pct() -> float:
+    """P&L realizzato nel mese corrente come % del capitale reale corrente
+    del bucket (_current_bucket_capital_estimate, non piu' capital.seed
+    fisso — vedi commento li' per il motivo) — ricalcolato ogni volta da
+    capital_log invece di un contatore incrementale (monthly_pnl_pct/
+    month_start non erano mai resettati a inizio mese, kill-switch mai
+    davvero utilizzabile — trovato in deep audit 29/08/2026, backlog #5).
+    Esclude 'seed' (non e' P&L) e 'broker_sync' (riallineamento contabile,
+    non un guadagno/perdita reale)."""
+    row = _conn().execute(
+        "SELECT COALESCE(SUM(amount), 0) AS total FROM capital_log "
+        "WHERE created_at >= strftime('%Y-%m-01', 'now') "
+        "AND event NOT IN ('seed', 'broker_sync')"
+    ).fetchone()
+    monthly_pnl = float(row["total"])
+    denom = _current_bucket_capital_estimate()
+    if denom <= 0:
+        denom = float(get_capital()["seed"] or 0)
+    if denom <= 0:
+        return 0.0
+    return monthly_pnl / denom
 
 
 def is_paused() -> bool:

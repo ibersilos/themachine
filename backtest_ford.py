@@ -338,6 +338,25 @@ def main():
     print(f"  Alpha premi vs B&H:   {ann_pct - bh_ann:+.1f}%")
     print()
 
+    # Rendimento totale stimato (premi + variazione azionaria) — supplemento
+    # trasparente al "Premi netti annui" sopra, che conta solo la gamba
+    # opzione. Per TARGET_DTE>21 lo stop meccanico chiude spesso call ITM
+    # "in perdita" sulla sola gamba opzione senza mai accreditare il guadagno
+    # non realizzato sul sottostante che il wheel continua di fatto a
+    # detenere — questa riga rende visibile se quella perdita apparente e'
+    # reale o solo un artefatto della contabilita' per-opzione. Approssimato:
+    # assume 100 azioni detenute per l'intero periodo (non traccia i cambi
+    # di fase CC/CSP cambio per cambio) — non sostituisce un vero motore a
+    # stato azionario, solo un segnale di allarme. Trovato in deep audit
+    # 29/08/2026, backlog #10 — mitigazione, non un fix completo.
+    stock_change_pnl = (bh_end - bh_start) * SHARES
+    total_est_pnl = total_prem + stock_change_pnl
+    total_est_ann_pct = (total_est_pnl / initial_capital) / years * 100
+    print(f"  -- Rendimento totale stimato (premi + azionario, approssimato) --")
+    print(f"  Variazione azionaria: ${stock_change_pnl:+.0f} (100 az. per l'intero periodo, approssimato)")
+    print(f"  Totale stimato:       ${total_est_pnl:+.0f} ({total_est_ann_pct:+.1f}%/anno)")
+    print()
+
     # Dettaglio cicli
     print(f"  {'Data':<12} {'Fase':<4} {'Stock':>6} {'K':>5} {'Vol%':>5} {'Prem':>5} {'PnL':>7}  Esito")
     print("  " + "-" * 75)

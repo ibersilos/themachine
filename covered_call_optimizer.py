@@ -536,6 +536,98 @@ class HogueOptimizer:
             logger.error("check_roll_opportunity error: %s", exc)
             return HogueAction(action="hold", urgency="info", reason=f"Errore calcolo roll: {exc}")
 
+    def check_roll_opportunity_put(self, position: WheelPosition) -> HogueAction:
+        """
+        Valuta se fare roll down-and-out di una CSP minacciata (mirror di
+        check_roll_opportunity per il lato put) — mai implementato prima:
+        le CSP minacciate ricevevano solo un avviso generico, nessun roll
+        automatico (gap trovato in deep audit 29/08/2026, backlog #11).
+
+        Regole (simmetriche a check_roll_opportunity):
+          - stock_price < strike * (2 - HOGUE_ROLL_TRIGGER_PCT) E DTE > 7 → valuta roll
+          - credito netto > 0 E roll_count < MAX_ROLLS → suggerisci roll (strike piu' basso)
+          - credito netto <= 0 OPPURE roll_count >= MAX_ROLLS → lascia assegnare
+        """
+        ticker_obj  = _get_ticker(position.ticker)
+        stock_price = _current_price(ticker_obj)
+        if stock_price <= 0:
+            return HogueAction(action="hold", urgency="info", reason="Prezzo non disponibile")
+
+        trigger_price = position.strike * (2 - config.HOGUE_ROLL_TRIGGER_PCT)
+
+        if stock_price >= trigger_price or position.days_to_expiry <= 7:
+            return HogueAction(
+                action="hold",
+                urgency="info",
+                reason=f"Nessun roll necessario — stock ${stock_price:.2f}, strike ${position.strike:.2f}, {position.days_to_expiry} DTE",
+            )
+
+        if position.roll_count >= config.HOGUE_MAX_ROLLS:
+            action = HogueAction(
+                action="assigned",
+                urgency="normal",
+                reason=f"Raggiunto limite roll ({config.HOGUE_MAX_ROLLS}) — lascia assegnare a ${position.strike:.2f}",
+                details={"roll_count": position.roll_count, "stock_price": stock_price},
+            )
+            action.telegram_msg = self._fmt_assigned_put(position, stock_price)
+            return action
+
+        cost_to_close = position.premium_current
+        new_expiry = _best_expiry(ticker_obj, config.HOGUE_TARGET_DTE)
+        if not new_expiry:
+            return HogueAction(action="hold", urgency="info", reason="Nessuna scadenza disponibile per roll")
+
+        try:
+            _, puts = _get_option_chain(ticker_obj, new_expiry)
+            # Roll down: strike inferiore all'attuale
+            otm_puts = puts[puts["strike"] < position.strike]
+            if otm_puts.empty:
+                otm_puts = puts
+
+            # Primo strike sotto il prezzo corrente, il piu' vicino
+            roll_candidates = otm_puts[otm_puts["strike"] < stock_price].sort_values("strike", ascending=False)
+            if roll_candidates.empty:
+                roll_candidates = otm_puts.sort_values("strike", ascending=False)
+
+            best_roll   = roll_candidates.iloc[0]
+            new_strike  = float(best_roll["strike"])
+            new_premium = _mid_price(best_roll)
+            net_credit  = round(new_premium - cost_to_close, 2)
+
+            if net_credit > 0:
+                action = HogueAction(
+                    action="roll",
+                    urgency="normal",
+                    reason=f"Roll down-and-out a ${new_strike:.0f} scad. {new_expiry} — credito netto ${net_credit:.2f}",
+                    details={
+                        "new_strike":   new_strike,
+                        "new_expiry":   new_expiry,
+                        "new_premium":  new_premium,
+                        "cost_to_close": cost_to_close,
+                        "net_credit":   net_credit,
+                        "roll_number":  position.roll_count + 1,
+                    },
+                )
+                action.telegram_msg = self._fmt_roll_put(position, action, stock_price)
+                return action
+            else:
+                action = HogueAction(
+                    action="assigned",
+                    urgency="normal",
+                    reason=f"Roll a debito netto (${abs(net_credit):.2f}) — meglio lasciare assegnare",
+                    details={
+                        "net_credit":  net_credit,
+                        "stock_price": stock_price,
+                        "strike":      position.strike,
+                    },
+                )
+                action.telegram_msg = self._fmt_assigned_put(position, stock_price)
+                return action
+
+        except Exception as exc:
+            logger.error("check_roll_opportunity_put error: %s", exc)
+            return HogueAction(action="hold", urgency="info", reason=f"Errore calcolo roll: {exc}")
+
     # ── 3. Selezione Strike ───────────────────────────────────────────────────
 
     def select_strike(
@@ -1037,6 +1129,26 @@ class HogueOptimizer:
             f"Azioni vendute a `${pos.strike:.0f}` + premio `${pos.premium_received:.2f}` incassato\n"
             f"PnL stimato: `${gain_loss:+.2f}` per contratto\n\n"
             f"_Valuta riacquisto azioni per nuovo ciclo CSP._"
+        )
+
+    def _fmt_roll_put(self, pos: WheelPosition, action: HogueAction, stock_price: float) -> str:
+        d = action.details
+        return (
+            f"🔄 *ROLL — {pos.ticker}* (roll #{d['roll_number']}/{config.HOGUE_MAX_ROLLS})\n"
+            f"Stock: `${stock_price:.2f}` | Strike attuale: `${pos.strike:.0f}`\n\n"
+            f"Chiudi CSP `${pos.strike:.0f}` @ `${d['cost_to_close']:.2f}`\n"
+            f"Vendi CSP `${d['new_strike']:.0f}` scad. `{d['new_expiry']}` @ `${d['new_premium']:.2f}`\n"
+            f"*Credito netto: `${d['net_credit']:.2f}`* ✅"
+        )
+
+    def _fmt_assigned_put(self, pos: WheelPosition, stock_price: float) -> str:
+        gain_loss = (pos.premium_received - max(pos.strike - stock_price, 0)) * 100
+        return (
+            f"📦 *ASSEGNAZIONE PREVISTA — {pos.ticker}*\n"
+            f"Stock: `${stock_price:.2f}` < Strike: `${pos.strike:.0f}`\n"
+            f"Azioni comprate a `${pos.strike:.0f}` + premio `${pos.premium_received:.2f}` incassato\n"
+            f"PnL stimato se venduto ora: `${gain_loss:+.2f}` per contratto\n\n"
+            f"_Valuta apertura nuovo ciclo CC sulle azioni assegnate._"
         )
 
     def _fmt_collar(self, pos: WheelPosition, d: dict) -> str:
