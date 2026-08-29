@@ -21,6 +21,7 @@ from typing import Optional
 import yfinance as yf
 import numpy as np
 import pandas as pd
+from scipy.stats import norm
 
 import config
 import database as db
@@ -71,6 +72,22 @@ def _annual_dividend(ticker_obj: yf.Ticker) -> float:
         return 0.0
 
 
+_SUGGEST_RISK_FREE = 0.05
+
+
+def _bs_delta(spot: float, strike: float, dte: int, iv: float, right: str) -> float | None:
+    """Delta Black-Scholes (valore assoluto, 0-1). None se input invalidi.
+    Stessa formula di wheel_scanner._bs_put_delta, generalizzata a call/put —
+    prima suggest_next_cycle selezionava per % OTM fissa (0.03), contraddicendo
+    la regola di casa validata da backtest il 27/08 ("selezione per delta
+    sempre, mai % fissa"). Trovato in deep audit 29/08/2026."""
+    if spot <= 0 or strike <= 0 or dte <= 0 or iv <= 0:
+        return None
+    T = dte / 365.0
+    d1 = (np.log(spot / strike) + (_SUGGEST_RISK_FREE + 0.5 * iv**2) * T) / (iv * np.sqrt(T))
+    return float(norm.cdf(d1)) if right == "call" else float(abs(norm.cdf(d1) - 1))
+
+
 # ── Suggest helper ────────────────────────────────────────────────────────────
 
 def suggest_next_cycle(ticker: str, phase: str = "cc") -> dict:
@@ -114,15 +131,13 @@ def suggest_next_cycle(ticker: str, phase: str = "cc") -> dict:
         atm_iv = float(atm_row["impliedVolatility"].iloc[0]) if "impliedVolatility" in atm_row else 0.0
     iv_rank = _calculate_iv_rank(ticker_obj, atm_iv)
 
-    # Selezione strike
+    # Selezione strike per delta Black-Scholes (mai % OTM fissa — regola di
+    # casa validata dal backtest 27/08, disallineamento corretto 29/08/2026).
+    right = "call" if phase == "cc" else "put"
     if phase == "cc":
-        otm_pct = 0.03
         candidates = calls[calls["strike"] > spot].copy()
-        candidates = candidates[candidates["strike"] <= spot * 1.12]
     else:
-        otm_pct = 0.03
         candidates = puts[puts["strike"] < spot].copy()
-        candidates = candidates[candidates["strike"] >= spot * 0.88]
 
     if candidates.empty:
         return {"error": "Nessuno strike idoneo trovato"}
@@ -130,26 +145,44 @@ def suggest_next_cycle(ticker: str, phase: str = "cc") -> dict:
     candidates = candidates.copy()
     candidates["mid"] = candidates.apply(_mid_price, axis=1)
     candidates["spread_pct"] = (candidates["ask"] - candidates["bid"]) / candidates["mid"].clip(0.01)
+    candidates["spread_abs"] = candidates["ask"] - candidates["bid"]
     candidates["oi"] = candidates["openInterest"].fillna(0).astype(int)
     candidates["ann_ret"] = candidates["mid"] / spot * (365 / max(dte, 1)) * 100
+    candidates["delta"] = candidates.apply(
+        lambda r: _bs_delta(spot, r["strike"], dte, float(r.get("impliedVolatility") or 0.0), right),
+        axis=1,
+    )
 
-    # Filtri base
-    candidates = candidates[candidates["mid"] >= 0.10]
-    candidates = candidates[candidates["spread_pct"] <= 0.20]
-    candidates = candidates[candidates["oi"] >= 100]
+    # Filtri — stessi di wheel_scanner.py, letti da config invece che
+    # ridichiarati hardcoded (spread_pct<=0.20 qui vs config 0.10 era
+    # un'incoerenza diretta, trovata in deep audit 29/08/2026).
+    candidates = candidates[candidates["mid"] >= config.WHEEL_MIN_PREMIUM]
+    candidates = candidates[
+        (candidates["spread_pct"] <= config.WHEEL_MAX_SPREAD_PCT)
+        | (candidates["spread_abs"] <= config.WHEEL_MAX_SPREAD_ABS)
+    ]
+    candidates = candidates[candidates["oi"] >= config.WHEEL_OI_MIN]
+    candidates = candidates[candidates["delta"].notna()]
+    candidates = candidates[
+        (candidates["delta"] >= config.WHEEL_PUT_DELTA_MIN) & (candidates["delta"] <= config.WHEEL_PUT_DELTA_MAX)
+    ]
 
     if candidates.empty:
-        return {"error": "Nessun candidato dopo filtri (OI/spread)"}
+        return {"error": "Nessun candidato dopo filtri (delta/OI/spread)"}
 
-    # Migliore: più vicino al target OTM con OI alto
-    target_strike = spot * (1 + otm_pct) if phase == "cc" else spot * (1 - otm_pct)
-    candidates["_score"] = (candidates["strike"] - target_strike).abs() / spot
+    # Migliore: delta più vicino al bordo superiore della banda (stesso
+    # target di backtest_ford.py TARGET_DELTA=0.30) con OI alto
+    target_delta = config.WHEEL_PUT_DELTA_MAX
+    candidates["_score"] = (candidates["delta"] - target_delta).abs()
     best = candidates.sort_values("_score").iloc[0]
 
-    ann_ret = float(best["ann_ret"])
-    mid     = float(best["mid"])
-    strike  = float(best["strike"])
-    oi      = int(best["oi"])
+    ann_ret     = float(best["ann_ret"])
+    mid         = float(best["mid"])
+    strike      = float(best["strike"])
+    oi          = int(best["oi"])
+    best_delta  = float(best["delta"])
+    net_premium = mid * 100 - 2 * config.WHEEL_COMMISSION_PER_ORDER
+    ann_ret_net = (net_premium / 100 / strike) * (365 / max(dte, 1)) * 100
 
     return {
         "ticker":          ticker,
@@ -159,8 +192,10 @@ def suggest_next_cycle(ticker: str, phase: str = "cc") -> dict:
         "expiry":          expiry,
         "dte":             dte,
         "mid":             round(mid, 2),
+        "delta":           round(best_delta, 3),
         "ann_ret":         round(ann_ret, 1),
-        "iv_rank":         round(iv_rank, 1),
+        "ann_ret_net":     round(ann_ret_net, 1),
+        "iv_rank":         round(iv_rank, 1) if iv_rank is not None else None,
         "atm_iv_pct":      round(atm_iv * 100, 1),
         "oi":              oi,
         "earnings":        earnings.isoformat() if earnings else None,
@@ -208,14 +243,15 @@ def _fmt_suggest(s: dict) -> str:
 
     phase_label = "Covered Call" if s["phase"] == "CC" else "Cash-Secured Put"
     ordine = "VENDI" if True else ""
+    iv_rank_str = f"{s['iv_rank']:.0f}%" if s['iv_rank'] is not None else "n/d"
 
     return (
         f"📊 *SUGGEST — {s['ticker']} ({s['phase']})*\n"
-        f"Spot: `${s['spot']:.2f}` | IV Rank: `{s['iv_rank']:.0f}%` | ATM IV: `{s['atm_iv_pct']:.0f}%`\n\n"
+        f"Spot: `${s['spot']:.2f}` | IV Rank: `{iv_rank_str}` | ATM IV: `{s['atm_iv_pct']:.0f}%`\n\n"
         f"*{ordine} {phase_label}:*\n"
-        f"  Strike: `${s['strike']:.2f}` | Scad: `{s['expiry']}` ({s['dte']} DTE)\n"
+        f"  Strike: `${s['strike']:.2f}` (delta `{s['delta']:.2f}`) | Scad: `{s['expiry']}` ({s['dte']} DTE)\n"
         f"  Premio mid: `${s['mid']:.2f}` → `${s['mid']*100:.0f}` per contratto\n"
-        f"  Ann. return: `{s['ann_ret']:.1f}%` | OI: `{s['oi']:,}`\n"
+        f"  Ann. return netto: `{s['ann_ret_net']:.1f}%` (lordo {s['ann_ret']:.1f}%) | OI: `{s['oi']:,}`\n"
         + (f"  Dividendo annuo: `${s['annual_div']:.2f}/az` (+`${s['annual_div']*100:.0f}`/anno)\n" if s['annual_div'] else "")
         + f"{warn}"
     )
@@ -368,30 +404,53 @@ def _check_cycle(cycle_row) -> None:
         logger.info("Advisory CLOSE inviato: %s %s", ticker, expiry_str)
         return
 
-    roll_action = _opt.check_roll_opportunity(position)
-    if roll_action.action == "roll":
-        d = roll_action.details
-        msg = _fmt_advisory(
-            cycle_row,
-            action_str=f"ROLL UP-AND-OUT — strike ${d['new_strike']:.0f} scad {d['new_expiry']}",
-            detail=(
-                f"1) Ricompra Call ${strike:.1f} a ${d['cost_to_close']:.2f}\n"
-                f"2) Vendi Call ${d['new_strike']:.0f} scad {d['new_expiry']} a ${d['new_premium']:.2f}\n"
-                f"Credito netto: ${d['net_credit']:.2f} (roll #{d['roll_number']}/{config.HOGUE_MAX_ROLLS})"
-            ),
-            urgency="normal",
-        )
-        send_alert(msg)
-        return
+    # check_roll_opportunity() e' logica solo-covered-call (roll up-and-out via
+    # catena call, trigger stock>strike*pct) — applicata prima anche alle CSP
+    # con la direzione invertita: su una put ITM reale poteva sopprimere un
+    # roll difensivo necessario, o proporre "vendi una call" su una posizione
+    # short-put. Gate a covered_call finche' non esiste un roll down-and-out
+    # dedicato per le CSP (backlog — trovato in deep audit 29/08/2026).
+    if phase == "covered_call":
+        roll_action = _opt.check_roll_opportunity(position)
+        if roll_action.action == "roll":
+            d = roll_action.details
+            msg = _fmt_advisory(
+                cycle_row,
+                action_str=f"ROLL UP-AND-OUT — strike ${d['new_strike']:.0f} scad {d['new_expiry']}",
+                detail=(
+                    f"1) Ricompra Call ${strike:.1f} a ${d['cost_to_close']:.2f}\n"
+                    f"2) Vendi Call ${d['new_strike']:.0f} scad {d['new_expiry']} a ${d['new_premium']:.2f}\n"
+                    f"Credito netto: ${d['net_credit']:.2f} (roll #{d['roll_number']}/{config.HOGUE_MAX_ROLLS})"
+                ),
+                urgency="normal",
+            )
+            send_alert(msg)
+            return
 
-    if roll_action.action == "assigned":
+        if roll_action.action == "assigned":
+            msg = _fmt_advisory(
+                cycle_row,
+                action_str="LASCIA ASSEGNARE — max roll raggiunto o roll a debito",
+                detail=(
+                    f"Stock ${stock_price:.2f} > strike ${strike:.1f}. "
+                    f"Azioni vendute a ${strike:.1f} + premio ${prem_recv:.2f} incassato. "
+                    f"Poi usa /open {ticker} CSP per il prossimo ciclo."
+                ),
+                urgency="normal",
+            )
+            send_alert(msg)
+            return
+    elif phase == "csp" and stock_price and stock_price <= strike * 0.97:
+        # Nessun roll down-and-out automatico ancora implementato per le CSP
+        # (vedi commento sopra) — segnala solo il rischio, decisione manuale.
         msg = _fmt_advisory(
             cycle_row,
-            action_str="LASCIA ASSEGNARE — max roll raggiunto o roll a debito",
+            action_str="CSP MINACCIATA — valuta roll manuale o assegnazione",
             detail=(
-                f"Stock ${stock_price:.2f} > strike ${strike:.1f}. "
-                f"Azioni vendute a ${strike:.1f} + premio ${prem_recv:.2f} incassato. "
-                f"Poi usa /open {ticker} CSP per il prossimo ciclo."
+                f"Stock ${stock_price:.2f} sotto strike ${strike:.1f}. Nessun roll automatico "
+                f"disponibile per le CSP (solo per le CC) — valuta tu se rollare a strike "
+                f"inferiore/scadenza successiva su IBKR, o lasciare assegnare (poi `/open {ticker} CC` "
+                f"per il prossimo ciclo, azioni comprate a ${strike:.1f})."
             ),
             urgency="normal",
         )
@@ -522,7 +581,7 @@ def _daily_universe_scan() -> None:
         logger.info("wheel_daemon: universe scan — nessun candidato Tier-1 valido oggi")
         return
 
-    candidates.sort(key=lambda c: c[1].annualized_return, reverse=True)
+    candidates.sort(key=lambda c: c[1].annualized_return_net, reverse=True)
     best_ticker, best_put, div_yield = candidates[0]
 
     # Dedup: manda l'alert solo se il candidato migliore e' cambiato in modo
@@ -535,33 +594,33 @@ def _daily_universe_scan() -> None:
         or last["ticker"] != best_ticker
         or last["strike"] != best_put.strike
         or last["expiry"] != best_put.expiry
-        or abs((last["ann_return"] or 0) - best_put.annualized_return) >= ANN_RET_CHANGE_THRESHOLD
+        or abs((last["ann_return"] or 0) - best_put.annualized_return_net) >= ANN_RET_CHANGE_THRESHOLD
     )
     if not changed:
-        logger.info("wheel_daemon: universe scan invariato (%s %.1f%%) — alert soppresso", best_ticker, best_put.annualized_return)
+        logger.info("wheel_daemon: universe scan invariato (%s %.1f%%) — alert soppresso", best_ticker, best_put.annualized_return_net)
         return
 
     lines = [f"🔍 *SCAN UNIVERSO TIER-1 — {best_ticker} in testa*\n"]
     lines.append(
         f"Strike `${best_put.strike}` scad `{best_put.expiry}` (delta {best_put.delta}) — "
-        f"`{best_put.annualized_return:.1f}%/anno` annualizzato"
+        f"`{best_put.annualized_return_net:.1f}%/anno` annualizzato"
         + (f", dividendo `{div_yield:.1f}%`" if div_yield else "")
     )
     if len(candidates) > 1:
-        others = ", ".join(f"{t} {p.annualized_return:.1f}%" for t, p, _ in candidates[1:4])
+        others = ", ".join(f"{t} {p.annualized_return_net:.1f}%" for t, p, _ in candidates[1:4])
         lines.append(f"Altri candidati: {others}")
     lines.append(f"\nUsa `/open {best_ticker} CSP {best_put.strike} {best_put.expiry} {best_put.mid:.2f}` per registrarlo dopo l'esecuzione manuale su IBKR.")
 
     send_alert("\n".join(lines))
-    db.set_last_universe_scan(best_ticker, best_put.strike, best_put.expiry, best_put.annualized_return)
+    db.set_last_universe_scan(best_ticker, best_put.strike, best_put.expiry, best_put.annualized_return_net)
     db.log_decision(
         "universe_scan_top",
         f"Strike ${best_put.strike} scad {best_put.expiry}, delta {best_put.delta}, "
-        f"ann.ret {best_put.annualized_return:.1f}%, OI {best_put.open_interest} — "
+        f"ann.ret {best_put.annualized_return_net:.1f}%, OI {best_put.open_interest} — "
         f"migliore tra {len(candidates)} candidati Tier-1 validi oggi",
         ticker=best_ticker, source="_daily_universe_scan",
     )
-    logger.info("wheel_daemon: universe scan inviato — top %s (%.1f%%)", best_ticker, best_put.annualized_return)
+    logger.info("wheel_daemon: universe scan inviato — top %s (%.1f%%)", best_ticker, best_put.annualized_return_net)
 
 
 # ── Sync capitale con broker ──────────────────────────────────────────────────

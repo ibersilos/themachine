@@ -52,7 +52,8 @@ class PutCandidate:
     open_interest: int
     volume: int
     spread_pct: float     # (ask-bid)/mid
-    annualized_return: float  # (mid/strike)*(365/dte)*100
+    annualized_return: float  # (mid/strike)*(365/dte)*100 — LORDO, prima di commissioni
+    annualized_return_net: float = 0.0  # netto di 2 commissioni (apertura+chiusura) — usato per filtro/ordinamento
     delta: float | None = None  # |delta| Black-Scholes (probabilita' di assegnazione approx)
 
 
@@ -167,6 +168,13 @@ def scan_wheel_candidate(ticker: str) -> WheelScanResult | None:
                 mid        = (bid + ask) / 2
                 spread_pct = (ask - bid) / mid if mid > 0 else 1.0
                 ann_ret    = (mid / strike) * (365 / dte) * 100 if dte > 0 else 0.0
+                # Netto di apertura+chiusura (2 ordini, caso peggiore Hogue con
+                # early-close) — prima il filtro/ordinamento usava solo il lordo,
+                # sovrastimando il rendimento mostrato su Telegram rispetto a
+                # quanto backtest_ford.py modella correttamente (trovato in deep
+                # audit 29/08/2026, commissione unificata via config).
+                net_premium = mid * 100 - 2 * config.WHEEL_COMMISSION_PER_ORDER
+                ann_ret_net = (net_premium / 100 / strike) * (365 / dte) * 100 if dte > 0 else 0.0
 
                 # Solo put OTM (CSP = vendere sotto mercato)
                 if strike >= spot * 1.01:
@@ -192,7 +200,7 @@ def scan_wheel_candidate(ticker: str) -> WheelScanResult | None:
                 # Tier 2: profitability (wheel-scout)
                 if mid < config.WHEEL_MIN_PREMIUM:
                     continue
-                if ann_ret < config.WHEEL_ANN_RETURN_MIN:
+                if ann_ret_net < config.WHEEL_ANN_RETURN_MIN:
                     continue
 
                 # Raccogli IV attorno al ATM (±5% dello spot) per VRP
@@ -205,6 +213,7 @@ def scan_wheel_candidate(ticker: str) -> WheelScanResult | None:
                     open_interest=oi, volume=vol,
                     spread_pct=spread_pct,
                     annualized_return=round(ann_ret, 2),
+                    annualized_return_net=round(ann_ret_net, 2),
                     delta=round(delta, 3),
                 ))
 
@@ -229,15 +238,17 @@ def scan_wheel_candidate(ticker: str) -> WheelScanResult | None:
             logger.info("[WHEEL] %s: IV Rank %.0f < min %.0f — candidati scartati", ticker, iv_rank, config.WHEEL_MIN_IV_RANK)
             candidates = []
 
-        # Rank per annualized return (stockpile: ordine per IV excess, qui ann.ret)
-        candidates.sort(key=lambda c: c.annualized_return, reverse=True)
+        # Rank per annualized return NETTO (stockpile: ordine per IV excess, qui
+        # ann.ret) — prima ordinava per il lordo, potendo preferire un candidato
+        # con premio alto ma su un ciclo a molti ordini/roll, netto peggiore.
+        candidates.sort(key=lambda c: c.annualized_return_net, reverse=True)
         best = candidates[0] if candidates else None
 
         logger.info(
             "wheel_scanner %s: %d candidati, VRP=%.2f, best=%s",
             ticker, len(candidates),
             vrp or 0,
-            f"${best.strike:.0f} {best.expiry} {best.annualized_return:.1f}%" if best else "nessuno",
+            f"${best.strike:.0f} {best.expiry} {best.annualized_return_net:.1f}% netto (lordo {best.annualized_return:.1f}%)" if best else "nessuno",
         )
 
         div_in_dte_window = False

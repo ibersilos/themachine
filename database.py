@@ -467,15 +467,20 @@ def sync_capital_from_broker(real_cash: float, note: str = "") -> float:
 
 def log_capital(event: str, amount: float, ticker: str | None = None,
                 note: str = "") -> float:
-    """Aggiorna il balance e registra il movimento. Restituisce il nuovo balance."""
+    """Aggiorna il balance e registra il movimento. Restituisce il nuovo balance.
+
+    UPDATE aritmetico atomico (balance=balance+?) invece di SELECT poi UPDATE:
+    con isolation_level di default sqlite3 il SELECT non prende un lock di
+    scrittura, quindi due scritture concorrenti (thread wheel_daemon vs
+    handler Telegram — rischio gia' segnalato nella skill) potevano leggere
+    lo stesso balance stale e una sovrascrivere l'altra (lost update). Trovato
+    in deep audit 29/08/2026."""
     with tx() as conn:
-        row = conn.execute("SELECT balance FROM capital WHERE id=1").fetchone()
-        current = float(row["balance"]) if row else 0.0
-        new_bal = current + amount
         conn.execute(
-            "UPDATE capital SET balance=?, updated_at=datetime('now') WHERE id=1",
-            (new_bal,),
+            "UPDATE capital SET balance = balance + ?, updated_at=datetime('now') WHERE id=1",
+            (amount,),
         )
+        new_bal = float(conn.execute("SELECT balance FROM capital WHERE id=1").fetchone()["balance"])
         conn.execute(
             "INSERT INTO capital_log (event, amount, ticker, note, balance_after) VALUES (?,?,?,?,?)",
             (event, amount, ticker, note, new_bal),

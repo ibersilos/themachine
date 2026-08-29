@@ -23,6 +23,7 @@ from typing import Optional
 import yfinance as yf
 import pandas as pd
 import numpy as np
+from scipy.stats import norm
 
 import config
 import database as db
@@ -142,7 +143,7 @@ def _mid_price(row: pd.Series) -> float:
     return float(row.get("lastPrice", 0) or 0)
 
 
-def calculate_iv_rank(ticker_obj: yf.Ticker, current_iv: float) -> float:
+def calculate_iv_rank(ticker_obj: yf.Ticker, current_iv: float) -> float | None:
     """
     Calcola IV Rank (0-100) confrontando IV attuale con il range delle ultime 52 settimane.
     Usa la volatilità storica dei prezzi come proxy se l'IV storica non è disponibile.
@@ -152,25 +153,32 @@ def calculate_iv_rank(ticker_obj: yf.Ticker, current_iv: float) -> float:
     una formula diversa (percentile-rank, tecnicamente "IV Percentile" non
     "IV Rank") senza sapere che questa esisteva gia'. Unificata qui, unica
     fonte di verita' per entrambi i moduli.
+
+    Ritorna None (non piu' 50.0) quando il dato non e' disponibile o il
+    calcolo fallisce — un 50.0 silenzioso passava per un IV Rank reale nei
+    filtri a valle (es. WHEEL_MIN_IV_RANK), nascondendo dati mancanti/di
+    yfinance inaffidabile dietro un numero plausibile. Trovato in deep audit
+    29/08/2026. I chiamanti devono trattare None come "non disponibile", non
+    come "neutro" — vedi WHEEL_MIN_IV_RANK check in wheel_scanner.py.
     """
     try:
         hist = _retry_yf(lambda: ticker_obj.history(period="1y"))
         if hist.empty:
-            return 50.0
+            return None
         returns = hist["Close"].pct_change().dropna()
         # Volatilità rolling a 20 giorni annualizzata
         rolling_vol = returns.rolling(20).std() * np.sqrt(252)
         vol_52w_low  = float(rolling_vol.min())
         vol_52w_high = float(rolling_vol.max())
         if vol_52w_high <= vol_52w_low:
-            return 50.0
+            return None
         # Usa current_iv se disponibile, altrimenti vol recente
         iv = current_iv if current_iv > 0 else float(rolling_vol.iloc[-1])
         rank = (iv - vol_52w_low) / (vol_52w_high - vol_52w_low) * 100
         return round(max(0.0, min(100.0, rank)), 1)
     except Exception as exc:
         logger.warning("IV Rank calculation failed: %s", exc)
-        return 50.0
+        return None
 
 
 _calculate_iv_rank = calculate_iv_rank  # alias retrocompatibile per le call site interne
@@ -239,15 +247,29 @@ def _earnings_date(ticker_obj: yf.Ticker) -> date | None:
     return None
 
 
+_FIND_STRIKE_RISK_FREE = 0.05
+
+
 def _find_strike_by_delta(
     calls_df: pd.DataFrame,
     stock_price: float,
     target_delta: float,
     otm_pct: float,
+    dte: int | None = None,
 ) -> tuple[float, float]:
     """
-    Trova lo strike OTM che meglio approssima il target_delta.
-    Strategia: cerca prima nel range OTM atteso, poi per il delta più vicino.
+    Trova lo strike OTM il cui delta Black-Scholes reale e' piu' vicino a
+    target_delta (usando l'IV per-strike della chain e il DTE reale, non
+    un'approssimazione lineare cieca a volatilita'/tempo).
+
+    Prima usava un'approssimazione lineare (delta ≈ 0.5-(strike-price)/price)
+    perche' yfinance non espone mai una colonna "delta" — quel fallback
+    ignorava IV e DTE, e il punteggio combinava "vicino al delta target" E
+    "vicino allo strike a otm_pct" nella stessa formula: due target spesso
+    incompatibili (es. regime laterale chiede insieme 3% OTM e delta 0.30,
+    ma un vero 0.30-delta richiede tipicamente uno strike molto piu' lontano
+    del 3%). Trovato in deep audit 29/08/2026 — ora seleziona per solo delta
+    reale, otm_pct resta solo come fallback se l'IV non e' disponibile.
     Ritorna (strike, mid_price).
     """
     if calls_df.empty:
@@ -258,23 +280,28 @@ def _find_strike_by_delta(
     if otm.empty:
         otm = calls_df.copy()
 
-    # Se disponibile delta in chain, usalo; altrimenti approssima da IV e DTE
-    if "delta" in otm.columns:
-        otm["_delta"] = otm["delta"].abs()
+    def _row_delta(row) -> float | None:
+        iv = float(row.get("impliedVolatility") or 0.0)
+        strike = float(row["strike"])
+        if iv <= 0 or strike <= 0 or not dte or dte <= 0:
+            return None
+        T = dte / 365.0
+        d1 = (np.log(stock_price / strike) + (_FIND_STRIKE_RISK_FREE + 0.5 * iv**2) * T) / (iv * np.sqrt(T))
+        return float(norm.cdf(d1))
+
+    otm["_delta"] = otm.apply(_row_delta, axis=1)
+
+    if otm["_delta"].notna().any():
+        valid = otm[otm["_delta"].notna()].copy()
+        valid["_score"] = (valid["_delta"] - target_delta).abs()
+        best = valid.loc[valid["_score"].idxmin()]
     else:
-        # Delta approssimato: OTM call ha delta ≈ 0.5 * (1 - (strike-price)/price)
-        otm["_delta"] = (0.5 - (otm["strike"] - stock_price) / stock_price).clip(0.05, 0.50)
+        # Nessuna IV utilizzabile su nessuno strike — fallback su otm_pct
+        # (solo qui, non piu' mescolato col punteggio delta).
+        target_strike = stock_price * (1 + otm_pct)
+        otm["_score"] = (otm["strike"] - target_strike).abs()
+        best = otm.loc[otm["_score"].idxmin()]
 
-    # Target strike da percentuale OTM
-    target_strike = stock_price * (1 + otm_pct)
-
-    # Punteggio combinato: vicinanza al delta target + vicinanza allo strike target
-    otm["_score"] = (
-        (otm["_delta"] - target_delta).abs() * 2
-        + (otm["strike"] - target_strike).abs() / stock_price
-    )
-
-    best = otm.loc[otm["_score"].idxmin()]
     return float(best["strike"]), _mid_price(best)
 
 
@@ -545,8 +572,10 @@ class HogueOptimizer:
         if iv_rank is None:
             iv_rank = _calculate_iv_rank(ticker_obj, atm_iv)
 
-        # Determina parametri per regime
-        if iv_rank > config.HOGUE_HIGH_IV_RANK:
+        # Determina parametri per regime — IV Rank None (non disponibile,
+        # non piu' un 50.0 fittizio) tratta come "IV non elevata": salta il
+        # ramo "IV alta" invece di rischiare un falso trigger.
+        if iv_rank is not None and iv_rank > config.HOGUE_HIGH_IV_RANK:
             otm_pct, target_delta, regime_label = 0.05, 0.25, "IV alta"
         elif market_regime == "bullish":
             otm_pct, target_delta, regime_label = 0.08, 0.15, "rialzista"
@@ -555,9 +584,8 @@ class HogueOptimizer:
         else:
             otm_pct, target_delta, regime_label = 0.03, 0.30, "laterale"
 
-        strike, premium = _find_strike_by_delta(calls, stock_price, target_delta, otm_pct)
-
         dte = (date.fromisoformat(expiry) - date.today()).days
+        strike, premium = _find_strike_by_delta(calls, stock_price, target_delta, otm_pct, dte)
         monthly_return_pct = (premium / stock_price) * (30 / max(dte, 1)) * 100
 
         return {
@@ -567,7 +595,7 @@ class HogueOptimizer:
             "expiry":           expiry,
             "dte":              dte,
             "premium":          round(premium, 2),
-            "iv_rank":          round(iv_rank, 1),
+            "iv_rank":          round(iv_rank, 1) if iv_rank is not None else None,
             "atm_iv":           round(atm_iv * 100, 1),
             "market_regime":    regime_label,
             "target_delta":     target_delta,
@@ -600,8 +628,13 @@ class HogueOptimizer:
                     atm_row = calls.iloc[(calls["strike"] - stock_price).abs().argsort()[:1]]
                     atm_iv  = float(atm_row["impliedVolatility"].iloc[0]) if "impliedVolatility" in atm_row else 0.0
                 iv_rank = _calculate_iv_rank(ticker_obj, atm_iv)
-            else:
-                iv_rank = 50.0
+            # else: nessuna scadenza disponibile — iv_rank resta None
+
+        # IV Rank None (dato non disponibile, non piu' un 50.0 fittizio che
+        # passava per un valore reale) — fail-safe: blocca esplicitamente
+        # invece di assumere neutro. Trovato in deep audit 29/08/2026.
+        if iv_rank is None:
+            return False, "IV Rank non disponibile — impossibile verificare la soglia minima, skip per sicurezza"
 
         if iv_rank < config.HOGUE_MIN_IV_RANK:
             return False, f"IV Rank {iv_rank:.0f}% < soglia {config.HOGUE_MIN_IV_RANK:.0f}% — skip ciclo, premia insufficienti"
@@ -799,16 +832,19 @@ class HogueOptimizer:
 
         if iv_rank is None:
             expiry_tmp = _best_expiry(ticker_obj)
-            iv_rank = 50.0
             if expiry_tmp:
                 calls, _ = _get_option_chain(ticker_obj, expiry_tmp)
                 if not calls.empty:
                     atm_row = calls.iloc[(calls["strike"] - stock_price).abs().argsort()[:1]]
                     atm_iv  = float(atm_row["impliedVolatility"].iloc[0]) if "impliedVolatility" in atm_row else 0.0
                     iv_rank = _calculate_iv_rank(ticker_obj, atm_iv)
+            # else: nessuna scadenza disponibile — iv_rank resta None
 
-        if iv_rank < config.HOGUE_HIGH_IV_RANK:
-            return None  # Iron Condor non appropriato
+        # IV Rank non disponibile (non piu' un 50.0 fittizio) — fail-safe:
+        # non proporre un Iron Condor senza un dato reale di IV Rank alto a
+        # supporto. Trovato in deep audit 29/08/2026.
+        if iv_rank is None or iv_rank < config.HOGUE_HIGH_IV_RANK:
+            return None  # Iron Condor non appropriato (o dato non disponibile)
 
         expiry = _best_expiry(ticker_obj)
         if not expiry:
@@ -900,11 +936,13 @@ class HogueOptimizer:
 
         if next_cycle:
             earnings_icon = "⚠️" if not next_cycle.get("earnings_ok", True) else "✅"
+            nc_iv_rank = next_cycle.get("iv_rank")
+            nc_iv_rank_str = f"{nc_iv_rank:.0f}%" if nc_iv_rank is not None else "n/d"
             lines += [
                 "📈 *Prossimo ciclo:*",
                 f"Strike: `${next_cycle.get('strike', 0):.0f}` scad. `{next_cycle.get('expiry', 'N/A')}`",
                 f"Premio stimato: `${next_cycle.get('premium', 0):.2f}` | Rendimento: `{next_cycle.get('monthly_return_pct', 0):.1f}%`/mese",
-                f"IV Rank: `{next_cycle.get('iv_rank', 0):.0f}%` | Earnings: {next_cycle.get('earnings_date', 'N/A')} {earnings_icon}",
+                f"IV Rank: `{nc_iv_rank_str}` | Earnings: {next_cycle.get('earnings_date', 'N/A')} {earnings_icon}",
             ]
 
         lines += [
@@ -951,14 +989,15 @@ class HogueOptimizer:
             ]
 
         wheel_ok = not next_cc.get("error")
-        iv_rank  = next_cc.get("iv_rank", 0)
+        iv_rank  = next_cc.get("iv_rank")
+        iv_rank_str = f"{iv_rank:.0f}%" if iv_rank is not None else "n/d"
         cc_str   = "sì ✅" if wheel_ok else "IV insufficiente ⚠️"
         lines += [
             f"📈 *WHEEL POSSIBILE:* {cc_str}",
         ]
         if wheel_ok:
             lines.append(
-                f"IV Rank: `{iv_rank:.0f}%` | Strike CC: `${next_cc['strike']:.0f}` | Premio: `${next_cc['premium']:.2f}`/mese"
+                f"IV Rank: `{iv_rank_str}` | Strike CC: `${next_cc['strike']:.0f}` | Premio: `${next_cc['premium']:.2f}`/mese"
             )
 
         # Nota: solo riferimento informativo, nessun ordine automatico — lo

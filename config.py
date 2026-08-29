@@ -100,6 +100,23 @@ WHEEL_MIN_IV_RANK:      float = _float("WHEEL_MIN_IV_RANK",     30.0)
 # totale del bucket.
 WHEEL_MAX_CONCENTRATION_PCT: float = _float("WHEEL_MAX_CONCENTRATION_PCT", 40.0)
 
+# Commissione IBKR per ordine (1 contratto, scaglione Tiered piu' basso).
+# Era $0.70 (mai verificato) solo in backtest_ford.py; corretto a $1.17 il
+# 29/08/2026 sulla media di 3 fill reali sul conto (F CSP 07/08 $1.42, F CC
+# 12/08 $1.04, PBR CC 27/08 ~$1.04). Fonte unica: prima il valore era
+# duplicato/assente tra backtest e moduli live (wheel_scanner,
+# strategy_advisor, covered_call_optimizer mostravano rendimenti lordi,
+# mai netti di commissione — trovato in deep audit 29/08/2026).
+WHEEL_COMMISSION_PER_ORDER: float = _float("WHEEL_COMMISSION_PER_ORDER", 1.17)
+
+# Ticker del PAC passivo (VWCE/EXUS) sullo stesso conto IBKR di the-machine —
+# da escludere dal denominatore del check di concentrazione del bucket wheel.
+# Bug trovato in deep audit 29/08/2026: check_concentration() veniva chiamato
+# con lo snapshot dell'intero conto (incl. VWCE ~89% del netliq), rendendo il
+# tetto WHEEL_MAX_CONCENTRATION_PCT quasi impossibile da far scattare — PBR
+# risultava ~14% del "totale" invece di essere vicino al 100% del bucket vero.
+PAC_EXCLUDE_TICKERS = ("VWCE", "EXUS")
+
 # ── Tier-1 universe — candidati wheel a capitale ridotto ─────────────────────
 # Criteri: prezzo $10-30 (lotto 100az abbordabile con capitale piccolo),
 # dividend yield >3%, market cap >$1B (liquidita' opzioni), sopra 200-SMA.

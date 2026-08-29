@@ -514,7 +514,7 @@ class TestFormatPickAlert(unittest.TestCase):
         self.assertIn("AAPL", msg)
         self.assertIn("78", msg)
         self.assertIn("162", msg)         # put strike
-        self.assertIn("Stop loss", msg)
+        self.assertIn("Riferimento -15%", msg)  # PRICE_STOP_LOSS_ENABLED=False by design — nessun ordine automatico, solo riferimento
         self.assertIn("Married Put", msg)
 
     @patch("covered_call_optimizer._earnings_date", return_value=None)

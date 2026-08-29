@@ -11,6 +11,8 @@ import pandas as pd
 import yfinance as yf
 from scipy.stats import norm
 
+import config
+
 warnings.filterwarnings("ignore")
 
 TICKER         = "F"
@@ -29,12 +31,29 @@ DTE_RULE       = 21
 MAX_ROLLS      = 2
 RISK_FREE      = 0.05
 SHARES         = 100
-# IBKR Tiered (passato da Fixed): niente minimo $1/ordine, ma costo per
-# contratto piu' alto a basso volume mensile — un conto piccolo che tratta
-# 1 contratto a botta resta nello scaglione piu' caro (~$0.65/contratto +
-# ~$0.05-0.10 fee regolamentari ORF/OCC). Stima, non dato dallo statement:
-# verificare col report Activity Fees IBKR per la cifra esatta.
-COMMISSION     = 0.70    # $/ordine (1 contratto, scaglione Tiered piu' basso)
+# Fonte unica: config.WHEEL_COMMISSION_PER_ORDER (era duplicata qui come
+# stima locale mai verificata $0.70, poi corretta a $1.17 ma isolata da
+# wheel_scanner/strategy_advisor/covered_call_optimizer — unificata il
+# 29/08/2026 in deep audit per evitare che backtest e moduli live mostrino
+# numeri diversi per lo stesso costo reale).
+COMMISSION     = config.WHEEL_COMMISSION_PER_ORDER    # $/ordine (1 contratto)
+# Bid-ask spread reale (mai gratis, a differenza della commissione IBKR e'
+# implicito nel prezzo eseguito). Stima conservativa per 1 contratto su
+# un sottostante liquido come F: ~$0.02/azione di mezzo-spread pagato sia
+# in apertura che in chiusura di ogni ordine. Applicato per-ordine come la
+# commissione, cosi' i cicli a DTE corto (piu' riaperture/anno, premio per
+# ciclo piu' piccolo) ne pagano proporzionalmente di piu' — a differenza del
+# vecchio haircut piatto "-35%" applicato solo in coda, che non catturava
+# questo effetto (bug trovato in verifica avversariale, 29/08/2026).
+SPREAD_COST    = 0.02 * SHARES   # $/ordine
+
+# Soglia DTE sotto la quale si tenta un roll del CC (Ford sale verso lo
+# strike). Scalata proporzionalmente a TARGET_DTE (era fissa a 7, tarata
+# implicitamente solo per TARGET_DTE=20 — bug trovato in verifica
+# avversariale 29/08/2026: con TARGET_DTE piu' corto la soglia fissa lasciava
+# quasi zero margine di roll, con TARGET_DTE piu' lungo copriva quasi tutto
+# il ciclo, rendendo il confronto tra DTE non comparabile).
+ROLL_DTE_THRESHOLD = max(2, round(TARGET_DTE * 0.35))
 
 
 def bs_call(S, K, T, r, sigma):
@@ -82,6 +101,10 @@ def main():
         hist = hist["Close"].to_frame("Close")
     hist = hist[["Close"]].copy()
     hist.index = pd.to_datetime(hist.index).tz_localize(None)
+    # yfinance a volte include una riga finale (sessione odierna/festivo)
+    # con Close = NaN, che rendeva NaN Buy&Hold/alpha in coda (bug trovato
+    # dallo sweep agent, 29/08/2026).
+    hist = hist.dropna(subset=["Close"])
 
     end_date   = date.today()
     start_date = date(end_date.year - BACKTEST_YEARS, end_date.month, end_date.day)
@@ -186,9 +209,8 @@ def main():
             pct = (prem_open - prem_now) / prem_open if prem_open > 0 else 0
 
             if pct >= EARLY_CLOSE:
-                rule = "21-DTE" if dte <= DTE_RULE else "50%"
                 cyc["prem_close"] = round(prem_now, 3)
-                cyc["exit"]       = f"Chiusura anticipata ({rule}) DTE={dte}"
+                cyc["exit"]       = f"Chiusura anticipata (50%) DTE={dte}"
                 cyc["pnl"]        = (prem_open - prem_now) * SHARES
                 cyc["close_date"] = td_date
                 cash += cyc["pnl"]
@@ -197,8 +219,15 @@ def main():
                 advanced_inline = True
                 break
 
-            # Roll CC se stock sale verso strike
-            if phase == "cc" and S_i > K * 0.97 and dte > 7 and roll_count < MAX_ROLLS:
+            # Roll CC se stock sale verso strike — controllato PRIMA dello
+            # stop meccanico 21-DTE: la difesa via roll deve avere priorita'
+            # sulla chiusura a tempo, altrimenti lo stop meccanico intercetta
+            # ogni minaccia ITM prima che il roll possa difenderla, per ogni
+            # TARGET_DTE in (ROLL_DTE_THRESHOLD, DTE_RULE] — bug trovato in
+            # seconda verifica avversariale, 29/08/2026 (la prima versione
+            # controllava lo stop meccanico prima del roll).
+            rolled_today = False
+            if phase == "cc" and S_i > K * 0.97 and dte > ROLL_DTE_THRESHOLD and roll_count < MAX_ROLLS:
                 new_T    = (TARGET_DTE + dte) / 365.0
                 new_K    = round_ford_strike(strike_for_delta(S_i, new_T, RISK_FREE, vol_i, TARGET_DELTA, "call"))
                 new_prem = bs_call(S_i, new_K, new_T, RISK_FREE, vol_i)
@@ -212,6 +241,27 @@ def main():
                     cyc["K"] = round(K, 2)
                     expiry_date = td_date + timedelta(days=TARGET_DTE)
                     cyc["expiry"] = expiry_date
+                    rolled_today = True
+
+            # Stop meccanico 21-DTE (Hogue) — indipendente dal profitto,
+            # chiude quando restano <=DTE_RULE giorni E il roll di oggi non
+            # ha gia' difeso/rinviato la posizione. Reale solo se
+            # TARGET_DTE > DTE_RULE: un ciclo aperto gia' a 20 DTE o meno
+            # non ha mai 21 giorni residui da raggiungere, quindi la regola
+            # semplicemente non si applica (non e' un bug, e' la realta' del
+            # meccanismo — prima era solo un'etichetta cosmetica sull'uscita
+            # a profitto, senza alcuna chiusura indipendente reale; trovato
+            # in verifica avversariale 29/08/2026).
+            if not rolled_today and TARGET_DTE > DTE_RULE and dte <= DTE_RULE:
+                cyc["prem_close"] = round(prem_now, 3)
+                cyc["exit"]       = f"Chiusura meccanica {DTE_RULE}-DTE"
+                cyc["pnl"]        = (prem_open - prem_now) * SHARES
+                cyc["close_date"] = td_date
+                cash += cyc["pnl"]
+                closed = True
+                cursor_idx = tday_to_pos[td]
+                advanced_inline = True
+                break
 
         if not closed:
             cyc["close_date"] = expiry_date
@@ -223,9 +273,9 @@ def main():
         # + 1 di buy-to-close se chiusura anticipata. Scadenza OTM e assegnazione
         # non generano un ordine opzioni aggiuntivo (nessun buy-back necessario).
         orders = 1 + 2 * cyc["rolled"]
-        if "Chiusura anticipata" in cyc["exit"]:
+        if "Chiusura anticipata" in cyc["exit"] or "Chiusura meccanica" in cyc["exit"]:
             orders += 1
-        commission = orders * COMMISSION
+        commission = orders * (COMMISSION + SPREAD_COST)
         cyc["commission"] = commission
         cyc["pnl"]       -= commission
         cash             -= commission
@@ -248,7 +298,7 @@ def main():
     total_comm  = sum(c["commission"] for c in cycles)
     gross_prem  = total_prem + total_comm
     assigned_n = sum(1 for c in cycles if c["assigned"])
-    early_n    = sum(1 for c in cycles if "anticipata" in c["exit"])
+    early_n    = sum(1 for c in cycles if "anticipata" in c["exit"] or "meccanica" in c["exit"])
     cc_n       = sum(1 for c in cycles if c["phase"] == "CC")
     csp_n      = sum(1 for c in cycles if c["phase"] == "CSP")
     roll_tot   = sum(c["rolled"] for c in cycles)
@@ -278,7 +328,7 @@ def main():
     print()
     print(f"  Premio medio/ciclo:   ${avg_pnl:.1f}")
     print(f"  Premi lordi totali:   ${gross_prem:.0f}")
-    print(f"  Commissioni totali:   ${total_comm:.0f}  (${COMMISSION:.2f}/ordine)")
+    print(f"  Commiss.+spread tot:  ${total_comm:.0f}  (${COMMISSION:.2f} comm + ${SPREAD_COST:.2f} spread /ordine, soglia roll={ROLL_DTE_THRESHOLD}g)")
     print(f"  Premi netti totali:   ${total_prem:.0f}")
     print(f"  Premi netti annui:    ${ann_prem:.0f}/anno")
     print(f"  Rendimento netto:     {ann_pct:+.1f}%/anno sul capitale iniziale")
@@ -304,8 +354,10 @@ def main():
         )
 
     print()
-    print("  NOTA: rendimenti sovrastimati (IV=HV20, no commissioni, riapertura immediata)")
-    print(f"  Stima realistica: divide premi del 30-40% -> ~{ann_pct*0.65:+.0f}%/anno")
+    print("  NOTA: commissioni + spread bid-ask per-ordine gia' sottratti sopra.")
+    print("  Approssimazioni residue: IV storica (HV20) come proxy dell'IV reale delle")
+    print("  opzioni (non e' dato storico di option chain reale); nessun rischio di")
+    print("  assegnazione anticipata da dividendo; execution a mid-price teorico BS.")
 
 
 if __name__ == "__main__":

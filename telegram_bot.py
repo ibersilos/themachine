@@ -194,7 +194,7 @@ def _format_wheel_alert(bd: ScoreBreakdown, signal: dict) -> str:
         lines.append("─────────────────────────")
         lines.append(f"🎯 *Miglior Put da vendere:*")
         lines.append(f"   Strike:  `${bp.strike:.0f}`  |  Scad: `{bp.expiry}` ({bp.dte}gg)")
-        lines.append(f"   Premio:  `${bp.mid:.2f}`  |  Ann.Ret: `{bp.annualized_return:.1f}%`")
+        lines.append(f"   Premio:  `${bp.mid:.2f}`  |  Ann.Ret netto: `{bp.annualized_return_net:.1f}%` (lordo {bp.annualized_return:.1f}%)")
         lines.append(f"   OI:      `{bp.open_interest:,}`  |  Spread: `{bp.spread_pct*100:.1f}%`")
 
     # Earnings status
@@ -436,7 +436,7 @@ async def _cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             live = _fetch_live_ibkr_snapshot()
             if live:
                 stocks, cash = live
-                check = strategy_advisor.check_concentration(ticker, strike * 100, stocks, cash)
+                check = strategy_advisor.check_concentration(ticker, strike * 100, _bucket_only(stocks), cash)
                 if check.exceeds_cap:
                     concentration_warning = f"\n\n⚠️ *Concentrazione*: {check.note}"
         except Exception as exc:
@@ -699,6 +699,14 @@ async def _cmd_capital(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+def _bucket_only(stocks: dict[str, float]) -> dict[str, float]:
+    """Esclude i ticker del PAC passivo (config.PAC_EXCLUDE_TICKERS) da uno
+    snapshot posizioni — il check di concentrazione deve valutare solo il
+    bucket wheel, non l'intero conto IBKR (bug trovato in deep audit
+    29/08/2026: VWCE/EXUS nel denominatore rendevano il tetto inutile)."""
+    return {t: v for t, v in stocks.items() if t not in config.PAC_EXCLUDE_TICKERS}
+
+
 def _fetch_live_ibkr_snapshot() -> tuple[dict[str, float], float] | None:
     """
     Prova a leggere posizioni reali da IBKR Client Portal Gateway locale.
@@ -770,8 +778,9 @@ async def _cmd_concentration(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     stocks, cash = live
+    stocks = _bucket_only(stocks)  # esclude VWCE/EXUS (PAC passivo) — vedi _bucket_only
     total = sum(stocks.values()) + cash
-    lines = [f"📊 *CONCENTRAZIONE BUCKET* (tetto {config.WHEEL_MAX_CONCENTRATION_PCT:.0f}%)\n"]
+    lines = [f"📊 *CONCENTRAZIONE BUCKET* (tetto {config.WHEEL_MAX_CONCENTRATION_PCT:.0f}%, PAC escluso)\n"]
     for ticker, val in sorted(stocks.items(), key=lambda x: -x[1]):
         pct = val / total * 100 if total else 0
         flag = "🔴" if pct > config.WHEEL_MAX_CONCENTRATION_PCT else "🟢"

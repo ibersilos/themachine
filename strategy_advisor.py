@@ -81,7 +81,7 @@ def compare(ticker: str, source: str, score: int) -> StrategyComparison:
     try:
         wr = ws.scan_wheel_candidate(ticker)
         if wr and wr.best_put:
-            cmp.wheel_ann_pct = wr.best_put.annualized_return
+            cmp.wheel_ann_pct = wr.best_put.annualized_return_net  # netto di commissione — confronto equo con l'edge trading (deep audit 29/08/2026)
             cmp.wheel_capital = wr.best_put.strike * 100
             cmp.wheel_note = f"strike ${wr.best_put.strike} scad {wr.best_put.expiry}, delta {wr.best_put.delta}"
         elif wr and wr.error:
