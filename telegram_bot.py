@@ -680,6 +680,88 @@ async def _cmd_capital(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
 
 
+def _fetch_live_ibkr_snapshot() -> tuple[dict[str, float], float] | None:
+    """
+    Prova a leggere posizioni reali da IBKR Client Portal Gateway locale.
+    Ritorna (posizioni {ticker: valore_mercato}, cash) o None se il Gateway
+    non è raggiungibile/autenticato — il chiamante deve avere un fallback.
+    """
+    from ibkr_connector import CPClient
+    try:
+        cp = CPClient()
+        if not cp.auth_status():
+            return None
+        summary = cp.get_account_summary()
+        positions = cp.get_all_positions()
+        if not summary:
+            return None
+        stocks = {p.ticker: p.market_val for p in positions if p.sec_type == "STK"}
+        return stocks, summary.total_cash
+    except Exception as exc:
+        logger.debug("_fetch_live_ibkr_snapshot: %s", exc)
+        return None
+
+
+async def _cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /portfolio — check istantaneo posizioni+P&L. Prova IBKR live (Client
+    Portal Gateway locale), altrimenti fallback su DB+yfinance (come /capital).
+    """
+    live = _fetch_live_ibkr_snapshot()
+
+    if live:
+        stocks, cash = live
+        total = sum(stocks.values()) + cash
+        lines = ["💼 *PORTAFOGLIO — dati IBKR live*\n"]
+        for ticker, val in sorted(stocks.items(), key=lambda x: -x[1]):
+            pct = val / total * 100 if total else 0
+            lines.append(f"  `{ticker}` `${val:,.2f}` ({pct:.1f}% del totale)")
+        lines.append(f"\nCash: `${cash:,.2f}`")
+        lines.append(f"*Totale: `${total:,.2f}`*")
+    else:
+        lines = ["⚠️ IBKR Gateway non raggiungibile — dati da DB (possono essere disallineati dal reale)\n"]
+        cap = db.get_capital()
+        positions = db.get_all_positions()
+        import yfinance as yf
+        for p in positions:
+            try:
+                price = yf.Ticker(p["ticker"]).fast_info.get("last_price") or float(p["entry_price"])
+            except Exception:
+                price = float(p["entry_price"])
+            val = price * float(p["shares"])
+            lines.append(f"  `{p['ticker']}` `${val:,.2f}`")
+        lines.append(f"\nCash (DB): `${cap['balance']:,.2f}`")
+
+    lines.append(f"\n🕐 `{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}`")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def _cmd_concentration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /concentration — % del bucket per ogni sottostante vs tetto
+    config.WHEEL_MAX_CONCENTRATION_PCT. Richiede IBKR live (senza dati
+    reali il check non ha senso — niente fallback DB qui).
+    """
+    live = _fetch_live_ibkr_snapshot()
+    if not live:
+        await update.message.reply_text(
+            "⚠️ IBKR Gateway non raggiungibile — il check di concentrazione richiede dati reali, niente fallback.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    stocks, cash = live
+    total = sum(stocks.values()) + cash
+    lines = [f"📊 *CONCENTRAZIONE BUCKET* (tetto {config.WHEEL_MAX_CONCENTRATION_PCT:.0f}%)\n"]
+    for ticker, val in sorted(stocks.items(), key=lambda x: -x[1]):
+        pct = val / total * 100 if total else 0
+        flag = "🔴" if pct > config.WHEEL_MAX_CONCENTRATION_PCT else "🟢"
+        lines.append(f"  {flag} `{ticker}` {pct:.1f}%")
+    lines.append(f"\nCash: {cash/total*100 if total else 0:.1f}%")
+    lines.append(f"\n🕐 `{datetime.utcnow().strftime('%Y-%m-%d %H:%M UTC')}`")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
 async def _cmd_dividend(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     /dividend <TICKER> <IMPORTO_PER_AZIONE>
@@ -804,6 +886,8 @@ def run_bot_in_thread() -> None:
         app.add_handler(CommandHandler("addpos",   _cmd_addpos))
         app.add_handler(CommandHandler("income",   _cmd_income))
         app.add_handler(CommandHandler("capital",  _cmd_capital))
+        app.add_handler(CommandHandler("portfolio",     _cmd_portfolio))
+        app.add_handler(CommandHandler("concentration", _cmd_concentration))
         app.add_handler(CommandHandler("dividend", _cmd_dividend))
 
         logger.info("Telegram bot polling started")
