@@ -194,6 +194,17 @@ class CPClient:
             self._account_id = accs[0] if accs else None
         return self._account_id
 
+    def is_paper_account(self) -> bool:
+        """
+        Account IBKR paper trading iniziano con 'DU', i conti live con 'U'.
+        Guardia di sicurezza indipendente da qualsiasi flag di config — se
+        questo ritorna False, place_order() rifiuta sempre, a prescindere
+        da PAPER_TRADING_MODE. Difesa in profondita': un config sbagliato
+        non deve poter piazzare un ordine su capitale reale.
+        """
+        acc = self.get_account_id()
+        return bool(acc) and acc.upper().startswith("DU")
+
     def get_account_summary(self) -> Optional[AccountSummary]:
         acc = self.get_account_id()
         if not acc:
@@ -292,6 +303,57 @@ class CPClient:
                 mid  = round((bid + ask) / 2, 4) if bid and ask else last
                 result[cid] = {"bid": bid, "ask": ask, "last": last, "mid": mid}
         return result
+
+    # ── Ordini (SOLO paper — vedi guardia in place_order) ───────────────────────
+
+    def place_order(self, conid: int, side: str, quantity: float, order_type: str = "LMT",
+                     price: float | None = None, tif: str = "DAY") -> dict:
+        """
+        Piazza un ordine reale via IBKR — RIFIUTA sempre se l'account
+        collegato non e' un conto paper (is_paper_account() == False),
+        indipendentemente da qualsiasi config. Nessuna eccezione a questa
+        regola: e' l'unica barriera tra un bug e capitale vero.
+
+        side: 'BUY' | 'SELL'. order_type: 'LMT' | 'MKT'. price obbligatorio per LMT.
+        Gestisce la conferma in due passi che l'API IBKR richiede (un ordine
+        puo' tornare un "reply" con warning da confermare — es. "sei su un
+        conto paper" — prima di essere effettivamente piazzato).
+        """
+        if not self.is_paper_account():
+            acc = self.get_account_id()
+            logger.error("place_order RIFIUTATO: account %s non e' un conto paper (serve prefisso DU)", acc)
+            return {"error": f"account {acc} non e' paper trading — ordine rifiutato per sicurezza"}
+
+        acc = self.get_account_id()
+        if not acc:
+            return {"error": "nessun account collegato"}
+
+        if order_type == "LMT" and price is None:
+            return {"error": "price obbligatorio per ordine LMT"}
+
+        order = {
+            "conid": conid,
+            "orderType": order_type,
+            "side": side.upper(),
+            "quantity": quantity,
+            "tif": tif,
+        }
+        if price is not None:
+            order["price"] = price
+
+        data = self._post(f"iserver/account/{acc}/orders", json={"orders": [order]})
+        if not data:
+            return {"error": "nessuna risposta da IBKR"}
+
+        # IBKR puo' rispondere con una lista di "reply" da confermare (warning
+        # su prezzo, conto paper, ecc.) invece di piazzare subito l'ordine.
+        if isinstance(data, list) and data and "id" in data[0] and "orderId" not in data[0]:
+            reply_id = data[0]["id"]
+            logger.info("place_order: conferma reply %s (warning: %s)", reply_id, data[0].get("message"))
+            confirm = self._post(f"iserver/reply/{reply_id}", json={"confirmed": True})
+            return {"result": confirm, "note": "confermato reply automaticamente (solo paper)"}
+
+        return {"result": data}
 
     def close(self):
         self._client.close()

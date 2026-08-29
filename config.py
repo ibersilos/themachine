@@ -87,10 +87,12 @@ WHEEL_ANN_RETURN_MIN:   float = _float("WHEEL_ANN_RETURN_MIN",  15.0) # rendimen
 WHEEL_PUT_DELTA_MIN:    float = _float("WHEEL_PUT_DELTA_MIN",   0.16)
 WHEEL_PUT_DELTA_MAX:    float = _float("WHEEL_PUT_DELTA_MAX",   0.30)
 
-# HV Rank minimo (percentile 0-100, proxy di IV Rank — vedi wheel_scanner._compute_hv_rank)
-# per vendere premio — sotto soglia la volatilita' non e' oggettivamente
-# elevata per quel titolo nel suo range recente, anche se VRP>1.1 nel momento.
-WHEEL_MIN_HV_RANK:      float = _float("WHEEL_MIN_HV_RANK",     30.0)
+# IV Rank minimo (0-100, standard min-max 52 sett. — covered_call_optimizer.
+# calculate_iv_rank, condivisa con wheel_scanner.py, unificate il 29/08/2026
+# dopo aver trovato due formule diverse per la stessa cosa) per vendere
+# premio — sotto soglia la volatilita' non e' oggettivamente elevata per
+# quel titolo nel suo range recente, anche se VRP>1.1 nel momento.
+WHEEL_MIN_IV_RANK:      float = _float("WHEEL_MIN_IV_RANK",     30.0)
 
 # Tetto di concentrazione per singolo sottostante — % del valore totale del
 # bucket (posizioni + cash). Gap trovato il 27/08/2026 aprendo PBR senza un

@@ -24,6 +24,7 @@ import yfinance as yf
 from scipy.stats import norm
 
 import config
+from covered_call_optimizer import calculate_iv_rank
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,7 @@ class WheelScanResult:
     best_put: PutCandidate | None = None
     vrp: float | None = None           # ATM_IV / HV_20 (>1 = premium elevato)
     hv_20: float | None = None         # 20-day historical volatility annualizzata
-    hv_rank: float | None = None       # percentile HV20 odierna vs 252gg precedenti (0-100)
+    iv_rank: float | None = None       # IV Rank standard (min-max 52 sett.) — condiviso con covered_call_optimizer.calculate_iv_rank
     atm_iv: float | None = None        # implied vol ATM media
     earnings_in_window: bool = False
     next_earnings: str | None = None   # YYYY-MM-DD
@@ -110,12 +111,9 @@ def scan_wheel_candidate(ticker: str) -> WheelScanResult | None:
             except Exception:
                 pass
 
-        # ── Dati storici per HV20, HV Rank e SMA50 ───────────────────────────
-        # 1y invece di 70d: serve la serie completa per il percentile HV Rank,
-        # non solo l'ultimo valore.
-        hist    = yf_obj.history(period="1y")
+        # ── Dati storici per HV20 e SMA50 ────────────────────────────────────
+        hist    = yf_obj.history(period="70d")
         hv_20   = _compute_hv(hist, window=20)
-        hv_rank = _compute_hv_rank(hist, window=20, lookback=252)
         sma50   = _safe_float(info.get("fiftyDayAverage"))
         above_sma50 = (spot >= sma50) if sma50 else True
 
@@ -128,7 +126,7 @@ def scan_wheel_candidate(ticker: str) -> WheelScanResult | None:
         option_dates = yf_obj.options
         if not option_dates:
             return WheelScanResult(
-                ticker=ticker, hv_20=hv_20, hv_rank=hv_rank,
+                ticker=ticker, hv_20=hv_20,
                 above_sma50=above_sma50,
                 next_earnings=next_earnings,
                 earnings_in_window=earnings_in_window,
@@ -214,6 +212,10 @@ def scan_wheel_candidate(ticker: str) -> WheelScanResult | None:
         atm_iv = float(np.mean(atm_ivs)) if atm_ivs else None
         vrp    = (atm_iv / hv_20) if (atm_iv and hv_20 and hv_20 > 0) else None
 
+        # IV Rank standard (min-max 52 sett.) — condiviso con
+        # covered_call_optimizer.calculate_iv_rank, non una seconda formula.
+        iv_rank = calculate_iv_rank(yf_obj, atm_iv or 0.0)
+
         # Tier 3: qualità (wheel-scout)
         if not above_sma50:
             logger.info("[WHEEL] %s: sotto 50-SMA — candidati scartati", ticker)
@@ -223,8 +225,8 @@ def scan_wheel_candidate(ticker: str) -> WheelScanResult | None:
             logger.info("[WHEEL] %s: earnings nella finestra DTE — candidati scartati", ticker)
             candidates = []
 
-        if hv_rank is not None and hv_rank < config.WHEEL_MIN_HV_RANK:
-            logger.info("[WHEEL] %s: HV Rank %.0f < min %.0f — candidati scartati", ticker, hv_rank, config.WHEEL_MIN_HV_RANK)
+        if iv_rank is not None and iv_rank < config.WHEEL_MIN_IV_RANK:
+            logger.info("[WHEEL] %s: IV Rank %.0f < min %.0f — candidati scartati", ticker, iv_rank, config.WHEEL_MIN_IV_RANK)
             candidates = []
 
         # Rank per annualized return (stockpile: ordine per IV excess, qui ann.ret)
@@ -250,7 +252,7 @@ def scan_wheel_candidate(ticker: str) -> WheelScanResult | None:
             best_put=best,
             vrp=vrp,
             hv_20=hv_20,
-            hv_rank=hv_rank,
+            iv_rank=iv_rank,
             atm_iv=atm_iv,
             earnings_in_window=earnings_in_window,
             next_earnings=next_earnings,
@@ -289,41 +291,6 @@ def _compute_hv(hist: pd.DataFrame, window: int = 20) -> float | None:
         return None
 
 
-def _compute_hv_rank(hist: pd.DataFrame, window: int = 20, lookback: int = 252) -> float | None:
-    """
-    Percentile (0-100) della HV a `window` giorni odierna rispetto alla sua
-    serie storica sugli ultimi `lookback` giorni di trading.
-
-    Proxy di IV Rank: la IV storica reale per singolo strike non e'
-    disponibile gratuitamente (yfinance da' solo la chain corrente, non uno
-    storico). HV Rank risponde alla stessa domanda — "la volatilita' e'
-    oggettivamente alta per questo titolo nel suo range recente, o solo
-    relativa alla HV di oggi (VRP)?" — usando solo dati prezzo, sempre
-    disponibili. Non e' IV Rank vero: se la vol implied diverge a lungo
-    dalla realized (skew strutturale) il proxy perde accuratezza.
-    """
-    try:
-        if hist is None or hist.empty:
-            return None
-        if isinstance(hist.columns, pd.MultiIndex):
-            closes = hist["Close"].iloc[:, 0].dropna()
-        else:
-            closes = hist["Close"].dropna()
-        if len(closes) < window + 2:
-            return None
-
-        log_ret = np.log(closes / closes.shift(1)).dropna()
-        hv_series = log_ret.rolling(window).std() * np.sqrt(252)
-        hv_series = hv_series.dropna().tail(lookback)
-        if len(hv_series) < window:  # troppo pochi punti per un percentile sensato
-            return None
-
-        today_hv = float(hv_series.iloc[-1])
-        rank = float((hv_series < today_hv).sum()) / len(hv_series) * 100
-        return round(rank, 1)
-    except Exception as e:
-        logger.debug("_compute_hv_rank error: %s", e)
-        return None
 
 
 def _check_earnings(yf_obj, dte_max: int) -> tuple[str | None, bool]:

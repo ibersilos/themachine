@@ -142,10 +142,16 @@ def _mid_price(row: pd.Series) -> float:
     return float(row.get("lastPrice", 0) or 0)
 
 
-def _calculate_iv_rank(ticker_obj: yf.Ticker, current_iv: float) -> float:
+def calculate_iv_rank(ticker_obj: yf.Ticker, current_iv: float) -> float:
     """
     Calcola IV Rank (0-100) confrontando IV attuale con il range delle ultime 52 settimane.
     Usa la volatilità storica dei prezzi come proxy se l'IV storica non è disponibile.
+
+    Formula standard (min-max su 52 settimane) — resa pubblica il 29/08/2026
+    perche' wheel_scanner.py aveva costruito una seconda implementazione con
+    una formula diversa (percentile-rank, tecnicamente "IV Percentile" non
+    "IV Rank") senza sapere che questa esisteva gia'. Unificata qui, unica
+    fonte di verita' per entrambi i moduli.
     """
     try:
         hist = _retry_yf(lambda: ticker_obj.history(period="1y"))
@@ -165,6 +171,9 @@ def _calculate_iv_rank(ticker_obj: yf.Ticker, current_iv: float) -> float:
     except Exception as exc:
         logger.warning("IV Rank calculation failed: %s", exc)
         return 50.0
+
+
+_calculate_iv_rank = calculate_iv_rank  # alias retrocompatibile per le call site interne
 
 
 def _current_price(ticker_obj: yf.Ticker) -> float:
