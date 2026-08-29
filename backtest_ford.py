@@ -16,9 +16,13 @@ warnings.filterwarnings("ignore")
 TICKER         = "F"
 BACKTEST_YEARS = 5
 TARGET_DTE     = 20
-# Selezione strike per delta Black-Scholes (0.16-0.30 standard CSP, qui il
-# punto medio 0.25) invece di banda fissa % dello spot — coerente con
-# wheel_scanner.py, cosi' il backtest valida la logica che gira davvero.
+# Selezione strike per delta Black-Scholes (banda 0.16-0.30 standard CSP,
+# qui fissato al bordo superiore 0.30 — testato anche 0.25, vedi confronto
+# nel log skill the-machine-analyst) invece di banda fissa % dello spot.
+# ATTENZIONE: questo backtest fissa SEMPRE 0.30, mentre wheel_scanner.py
+# (live) sceglie il miglior strike nella banda 0.16-0.30 secondo i filtri di
+# premio/rendimento — non e' una replica esatta della logica live, i
+# risultati sono un'approssimazione (trovato da code review, 29/08/2026).
 TARGET_DELTA   = 0.30
 EARLY_CLOSE    = 0.50
 DTE_RULE       = 21

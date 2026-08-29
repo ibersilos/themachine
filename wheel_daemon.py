@@ -564,6 +564,31 @@ def _daily_universe_scan() -> None:
     logger.info("wheel_daemon: universe scan inviato — top %s (%.1f%%)", best_ticker, best_put.annualized_return)
 
 
+# ── Sync capitale con broker ──────────────────────────────────────────────────
+
+def _sync_capital_ledger() -> None:
+    """
+    Riallinea capital_log al cash reale IBKR — db.sync_capital_from_broker()
+    esisteva da stamattina ma non era mai stata agganciata a nulla (trovato
+    da code review, 29/08/2026). Senza questo, il ledger torna a derivare in
+    silenzio ad ogni trade eseguito manualmente e non registrato via /open,
+    /close — esattamente il problema gia' risolto una volta oggi a mano.
+    """
+    try:
+        from ibkr_connector import CPClient
+        cp = CPClient()
+        if not cp.auth_status():
+            logger.debug("_sync_capital_ledger: Gateway non raggiungibile, skip")
+            return
+        summary = cp.get_account_summary()
+        if not summary:
+            return
+        db.sync_capital_from_broker(summary.total_cash, "Sync automatico giornaliero")
+        logger.info("wheel_daemon: capital ledger riallineato a $%.2f", summary.total_cash)
+    except Exception as exc:
+        logger.debug("_sync_capital_ledger: %s", exc)
+
+
 # ── Daily check ───────────────────────────────────────────────────────────────
 
 def _daily_check() -> None:
@@ -572,6 +597,11 @@ def _daily_check() -> None:
     logger.info("wheel_daemon: daily check avviato")
     open_cycles = db.get_open_cycles()
     positions   = db.get_all_positions()
+
+    try:
+        _sync_capital_ledger()
+    except Exception as exc:
+        logger.error("_sync_capital_ledger: %s", exc)
 
     try:
         _daily_universe_scan()

@@ -424,6 +424,24 @@ async def _cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     dte = (_date.fromisoformat(expiry) - _date.today()).days
     ann_ret = (premium / strike) * (365 / max(dte, 1)) * 100
 
+    # Check concentrazione — solo per CSP: impegna collaterale nuovo (strike*100),
+    # una CC su azioni gia' possedute non aumenta l'esposizione al ticker.
+    # Advisory: il trade e' gia' eseguito su IBKR quando arriva /open, quindi
+    # non blocchiamo la registrazione — solo avvisiamo. Trovato mai agganciato
+    # da code review, 29/08/2026.
+    concentration_warning = ""
+    if phase_db == "csp":
+        try:
+            import strategy_advisor
+            live = _fetch_live_ibkr_snapshot()
+            if live:
+                stocks, cash = live
+                check = strategy_advisor.check_concentration(ticker, strike * 100, stocks, cash)
+                if check.exceeds_cap:
+                    concentration_warning = f"\n\n⚠️ *Concentrazione*: {check.note}"
+        except Exception as exc:
+            logger.debug("Check concentrazione fallito in /open: %s", exc)
+
     # Registra incasso premio sul capitale (il premio arriva subito in cassa)
     new_bal = db.log_capital(
         "premium_in", pnl_per_contract, ticker,
@@ -437,7 +455,8 @@ async def _cmd_open(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"Ann. return stimato: `{ann_ret:.1f}%`\n"
         f"Capitale cash: `${new_bal:.2f}`\n\n"
         f"_Riceverai advisory automatici ogni mattina._\n"
-        f"Chiudi con `/close {ticker}`",
+        f"Chiudi con `/close {ticker}`"
+        f"{concentration_warning}",
         parse_mode=ParseMode.MARKDOWN,
     )
 

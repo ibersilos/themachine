@@ -1,9 +1,20 @@
 """
-backtest_wheel.py — Simulazione storica della strategia Wheel/Covered-Call
-con regole Hogue (50% early close, 21-DTE, 2 max roll, earnings buffer).
+backtest_wheel.py — ⚠️ ORFANO/OBSOLETO (trovato da code review, 29/08/2026).
 
-Usa yfinance per prezzi storici + Black-Scholes con HV20 come proxy IV.
-Nessuna IV storica reale disponibile da yfinance free — limitazione nota.
+Creato lo stesso giorno di backtest_ford.py (commit 3b47b48, 27/08/2026) ma
+mai piu' toccato — backtest_ford.py ha ricevuto tutti i fix successivi (bug
+loop infinito, commissioni Tiered, selezione strike per delta). Questo file
+seleziona ancora lo strike a BANDA FISSA % OTM, l'approccio sostituito dalla
+selezione per delta Black-Scholes ovunque nel sistema live. Se lo esegui,
+valida una strategia che the-machine non usa piu' — i risultati non
+rappresentano il comportamento reale del bot.
+
+Usare backtest_ford.py per backtest aggiornati. Questo file resta solo per
+riferimento storico — non eseguirlo pensando che rifletta la logica attuale.
+
+Simulazione storica della strategia Wheel/Covered-Call con regole Hogue
+(50% early close, 21-DTE, 2 max roll, earnings buffer). Usa yfinance per
+prezzi storici + Black-Scholes con HV20 come proxy IV.
 
 Esegui:
     python backtest_wheel.py
@@ -447,4 +458,12 @@ def main():
 
 
 if __name__ == "__main__":
+    print("=" * 70)
+    print("  ATTENZIONE: script orfano/obsoleto — vedi docstring in cima al file.")
+    print("  Usa backtest_ford.py per validare la strategia attuale (delta-based).")
+    print("  Imposta RUN_DEPRECATED_BACKTEST=1 per eseguirlo comunque.")
+    print("=" * 70)
+    import os
+    if os.getenv("RUN_DEPRECATED_BACKTEST") != "1":
+        raise SystemExit(1)
     main()
