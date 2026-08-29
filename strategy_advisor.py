@@ -26,6 +26,8 @@ import config
 import database as db
 import wheel_scanner as ws
 
+BXM_TICKER = "^BXM"  # CBOE S&P 500 BuyWrite Index — benchmark covered-call sistematico
+
 logger = logging.getLogger(__name__)
 
 MIN_SAMPLE_FOR_TRADING = 20   # sotto questo n, l'edge storico non e' affidabile
@@ -125,4 +127,72 @@ def compare(ticker: str, source: str, score: int) -> StrategyComparison:
     else:
         cmp.recommendation = f"TRADING (+{cmp.trading_period_pct - wheel_period_pct:.1f}pt su ~{TRADING_HORIZON_DAYS}gg — ma non garantito ripetibile, verifica prima di fidarti)"
 
+    db.log_decision("strategy_compare", cmp.recommendation, ticker=ticker, source="strategy_advisor.compare")
     return cmp
+
+
+@dataclass
+class ConcentrationCheck:
+    ticker: str
+    current_value: float
+    proposed_value: float
+    bucket_total: float
+    pct_after: float
+    exceeds_cap: bool
+    note: str = ""
+
+
+def check_concentration(ticker: str, proposed_new_value: float,
+                         positions: dict[str, float], cash: float) -> ConcentrationCheck:
+    """
+    Verifica se aprire/aumentare una posizione su `ticker` per
+    `proposed_new_value` sfonda il tetto di concentrazione del bucket.
+
+    `positions`: {ticker: valore_mercato} di TUTTE le posizioni attuali del
+    bucket (incluso eventualmente ticker stesso se gia' aperta — viene
+    sommato al nuovo valore, non sostituito). `cash`: cash libero nel bucket.
+
+    Va chiamata con dati reali (IBKR live), non con stime — il tetto serve a
+    prevenire un errore di concentrazione reale, non un esercizio teorico.
+    """
+    current_value = positions.get(ticker, 0.0)
+    bucket_total = sum(positions.values()) + cash
+    new_total_for_ticker = current_value + proposed_new_value
+    # Il bucket totale dopo l'operazione include il nuovo valore aggiunto
+    # (cash che si trasforma in posizione non cambia il totale, ma se e'
+    # capitale fresco che entra ora, va sommato).
+    bucket_after = bucket_total if proposed_new_value <= cash else bucket_total + (proposed_new_value - cash)
+    pct_after = (new_total_for_ticker / bucket_after * 100) if bucket_after > 0 else 100.0
+
+    exceeds = pct_after > config.WHEEL_MAX_CONCENTRATION_PCT
+    note = (
+        f"{ticker} arriverebbe al {pct_after:.1f}% del bucket "
+        f"({'sopra' if exceeds else 'sotto'} il tetto {config.WHEEL_MAX_CONCENTRATION_PCT:.0f}%)"
+    )
+    return ConcentrationCheck(
+        ticker=ticker, current_value=current_value, proposed_value=proposed_new_value,
+        bucket_total=bucket_after, pct_after=round(pct_after, 1), exceeds_cap=exceeds, note=note,
+    )
+
+
+def bxm_benchmark_return(start_date: str, end_date: str | None = None) -> float | None:
+    """
+    Ritorno % dell'indice CBOE S&P 500 BuyWrite (^BXM) tra start_date e
+    end_date (default: oggi). Benchmark corretto per una covered-call
+    sistematica — a differenza del buy&hold puro, sconta gia' lo scambio
+    upside-per-premio che la strategia fa strutturalmente. Da usare per
+    contestualizzare il rendimento del bucket, non per giudicarlo "buono/
+    cattivo" da solo (BXM storico 1986-2026: ~8.6%/anno — un bucket su
+    titoli singoli ad alta IV come F/PBR non e' direttamente comparabile,
+    la diversificazione e il livello di IV sono diversi).
+    """
+    import yfinance as yf
+    try:
+        hist = yf.Ticker(BXM_TICKER).history(start=start_date, end=end_date)
+        if hist.empty or len(hist) < 2:
+            return None
+        closes = hist["Close"].dropna()
+        return round(float((closes.iloc[-1] / closes.iloc[0] - 1) * 100), 2)
+    except Exception as exc:
+        logger.warning("bxm_benchmark_return: %s", exc)
+        return None

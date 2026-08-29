@@ -468,6 +468,10 @@ def _check_thesis_break(positions: list) -> None:
                     f"La tesi per cui tieni questo titolo (dividendo) potrebbe essersi rotta — "
                     f"verifica, non è un alert di prezzo."
                 )
+                db.log_decision(
+                    "thesis_break", f"Possibile taglio dividendo — {news.get('sa_latest_headline') or 'n/d'}",
+                    ticker=ticker, source="_check_thesis_break",
+                )
                 continue
 
             if ticker in config.WHEEL_TIER1_UNIVERSE:
@@ -478,6 +482,10 @@ def _check_thesis_break(positions: list) -> None:
                         f"⚠️ *DIVIDENDO NON RILEVATO — {ticker}*\n"
                         f"Nessun dividend rate annuo riportato — verifica se è stato "
                         f"sospeso (titolo Tier-1, scelto apposta per il dividendo)."
+                    )
+                    db.log_decision(
+                        "thesis_break", "Dividend rate annuo non rilevato su titolo Tier-1",
+                        ticker=ticker, source="_check_thesis_break",
                     )
         except Exception as exc:
             logger.debug("Thesis-break check %s: %s", ticker, exc)
@@ -546,6 +554,13 @@ def _daily_universe_scan() -> None:
 
     send_alert("\n".join(lines))
     db.set_last_universe_scan(best_ticker, best_put.strike, best_put.expiry, best_put.annualized_return)
+    db.log_decision(
+        "universe_scan_top",
+        f"Strike ${best_put.strike} scad {best_put.expiry}, delta {best_put.delta}, "
+        f"ann.ret {best_put.annualized_return:.1f}%, OI {best_put.open_interest} — "
+        f"migliore tra {len(candidates)} candidati Tier-1 validi oggi",
+        ticker=best_ticker, source="_daily_universe_scan",
+    )
     logger.info("wheel_daemon: universe scan inviato — top %s (%.1f%%)", best_ticker, best_put.annualized_return)
 
 

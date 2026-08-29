@@ -146,6 +146,19 @@ def init_db() -> None:
             ann_return  REAL,
             sent_at     TEXT
         );
+
+        -- Audit trail: ogni decisione/raccomandazione con la motivazione
+        -- testuale, interrogabile — non solo il messaggio Telegram (che
+        -- sparisce nella chat) ma un log strutturato persistente.
+        CREATE TABLE IF NOT EXISTS decision_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ticker      TEXT,
+            action      TEXT NOT NULL,   -- es: universe_scan_top | thesis_break | concentration_block | strategy_compare
+            rationale   TEXT NOT NULL,
+            source      TEXT,            -- funzione/modulo che ha generato la decisione
+            created_at  TEXT DEFAULT (datetime('now'))
+        );
+        CREATE INDEX IF NOT EXISTS idx_decision_log_ticker ON decision_log(ticker);
         """)
         # Migrazione: aggiungi colonna pipeline se non esiste (DB pre-dual-pipeline)
         try:
@@ -519,6 +532,28 @@ def upsert_backtest_result(signal_id: int, ticker: str, score: int | None,
              prices.get(5), prices.get(10), prices.get(20), prices.get(60),
              returns.get(5), returns.get(10), returns.get(20), returns.get(60)),
         )
+
+
+def log_decision(action: str, rationale: str, ticker: str | None = None, source: str = "") -> None:
+    """Registra una decisione/raccomandazione con motivazione — audit trail
+    interrogabile, non solo il testo effimero di un alert Telegram."""
+    with tx() as conn:
+        conn.execute(
+            "INSERT INTO decision_log (ticker, action, rationale, source) VALUES (?,?,?,?)",
+            (ticker, action, rationale, source),
+        )
+
+
+def get_decision_log(ticker: str | None = None, limit: int = 50) -> list:
+    conn = _conn()
+    if ticker:
+        return conn.execute(
+            "SELECT * FROM decision_log WHERE ticker=? ORDER BY id DESC LIMIT ?",
+            (ticker, limit),
+        ).fetchall()
+    return conn.execute(
+        "SELECT * FROM decision_log ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
 
 
 def get_last_universe_scan() -> dict | None:

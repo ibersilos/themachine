@@ -87,6 +87,17 @@ WHEEL_ANN_RETURN_MIN:   float = _float("WHEEL_ANN_RETURN_MIN",  15.0) # rendimen
 WHEEL_PUT_DELTA_MIN:    float = _float("WHEEL_PUT_DELTA_MIN",   0.16)
 WHEEL_PUT_DELTA_MAX:    float = _float("WHEEL_PUT_DELTA_MAX",   0.30)
 
+# HV Rank minimo (percentile 0-100, proxy di IV Rank — vedi wheel_scanner._compute_hv_rank)
+# per vendere premio — sotto soglia la volatilita' non e' oggettivamente
+# elevata per quel titolo nel suo range recente, anche se VRP>1.1 nel momento.
+WHEEL_MIN_HV_RANK:      float = _float("WHEEL_MIN_HV_RANK",     30.0)
+
+# Tetto di concentrazione per singolo sottostante — % del valore totale del
+# bucket (posizioni + cash). Gap trovato il 27/08/2026 aprendo PBR senza un
+# limite esplicito: ogni posizione veniva valutata isolata, mai contro il
+# totale del bucket.
+WHEEL_MAX_CONCENTRATION_PCT: float = _float("WHEEL_MAX_CONCENTRATION_PCT", 40.0)
+
 # ── Tier-1 universe — candidati wheel a capitale ridotto ─────────────────────
 # Criteri: prezzo $10-30 (lotto 100az abbordabile con capitale piccolo),
 # dividend yield >3%, market cap >$1B (liquidita' opzioni), sopra 200-SMA.
