@@ -535,6 +535,70 @@ class TestFormatPickAlert(unittest.TestCase):
         self.assertIn("IV insufficiente", msg)
 
 
+class TestMonthlyRealizedPnl(unittest.TestCase):
+    """Regression per database.get_monthly_realized_pnl_pct() — nessun test
+    la copriva prima (trovato in verifica finale 29/08/2026, subito dopo che
+    un bug reale nella prima versione — blocklist invece di allowlist,
+    'buy_shares' contato come perdita — aveva prodotto un falso -115.6%
+    mensile su dati reali). Usa un DB SQLite temporaneo isolato, MAI il DB di
+    produzione (data/the_machine.db) — un incidente reale nella stessa
+    sessione ha corrotto capital.balance in produzione durante un test
+    manuale ripulito solo a metà, lezione da non ripetere in automatico."""
+
+    def setUp(self):
+        import tempfile
+        import importlib
+        import config as _config
+        import database as _database
+
+        self._orig_db_path = _config.DB_PATH
+        self._tmpdir = tempfile.mkdtemp()
+        _config.DB_PATH = __import__("pathlib").Path(self._tmpdir) / "test_the_machine.db"
+
+        # Il modulo database tiene una connessione cache-ata per thread —
+        # va invalidata per farla ripuntare al DB temporaneo appena settato.
+        if hasattr(_database._local, "conn"):
+            _database._local.conn.close()
+            del _database._local.conn
+
+        self.db = _database
+        self.db.init_db()
+        self.db.seed_capital(1000.0)
+
+    def tearDown(self):
+        import config as _config
+        import database as _database
+        import shutil
+
+        if hasattr(_database._local, "conn"):
+            _database._local.conn.close()
+            del _database._local.conn
+        _config.DB_PATH = self._orig_db_path
+        shutil.rmtree(self._tmpdir, ignore_errors=True)
+
+    def test_buy_shares_not_counted_as_pnl(self):
+        """Un acquisto azionario non deve mai contare come perdita mensile —
+        il bug reale trovato oggi."""
+        self.db.log_capital("buy_shares", -800.0, ticker="F", note="test")
+        pct = self.db.get_monthly_realized_pnl_pct()
+        self.assertAlmostEqual(pct, 0.0, places=6)
+
+    def test_premium_events_counted_correctly(self):
+        """premium_in/premium_out/dividend devono contare, seed/broker_sync/
+        buy_shares no."""
+        self.db.log_capital("premium_in", 50.0, ticker="F", note="test")
+        self.db.log_capital("premium_out", -10.0, ticker="F", note="test")
+        self.db.log_capital("dividend", 5.0, ticker="F", note="test")
+        self.db.log_capital("buy_shares", -300.0, ticker="F", note="test")
+        self.db.upsert_position("F", cost_basis=3.0, shares=100)  # 3.0*100=300, coerente col buy_shares sopra
+        self.db.sync_capital_from_broker(700.0, note="test")
+
+        pct = self.db.get_monthly_realized_pnl_pct()
+        # Netto P&L reale: 50 - 10 + 5 = 45. Denominatore: cash reale (700,
+        # dopo sync) + posizioni a costo (300 su F) = 1000.
+        self.assertAlmostEqual(pct, 45.0 / 1000.0, places=4)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Runner diretto
 # ─────────────────────────────────────────────────────────────────────────────

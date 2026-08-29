@@ -215,12 +215,23 @@ def get_monthly_realized_pnl_pct() -> float:
     capital_log invece di un contatore incrementale (monthly_pnl_pct/
     month_start non erano mai resettati a inizio mese, kill-switch mai
     davvero utilizzabile — trovato in deep audit 29/08/2026, backlog #5).
-    Esclude 'seed' (non e' P&L) e 'broker_sync' (riallineamento contabile,
-    non un guadagno/perdita reale)."""
+
+    Allowlist esplicita di eventi che sono davvero P&L (premium_in,
+    premium_out, dividend) — NON una blocklist di 'seed'/'broker_sync' come
+    nella prima versione: quella versione includeva erroneamente 'buy_shares'
+    come se fosse una perdita, quando e' solo spostamento di capitale (cash
+    che diventa azioni di pari valore, non un guadagno/perdita). Bug trovato
+    subito dopo il primo utilizzo reale: mostrava -115.6% mensile (falso —
+    l'acquisto PBR/F/ALTO/SRI da solo pesava per oltre $3.200) invece del
+    P&L reale vicino a zero. 'sell_shares'/'adjustment' restano fuori
+    dall'allowlist perche' il loro importo grezzo non e' P&L diretto (il
+    proventi di una vendita non e' profitto, lo e' solo proventi-costo) —
+    da aggiungere con un calcolo dedicato se/quando servira'. Corretto in
+    verifica finale 29/08/2026, la stessa sessione del deploy."""
     row = _conn().execute(
         "SELECT COALESCE(SUM(amount), 0) AS total FROM capital_log "
         "WHERE created_at >= strftime('%Y-%m-01', 'now') "
-        "AND event NOT IN ('seed', 'broker_sync')"
+        "AND event IN ('premium_in', 'premium_out', 'dividend')"
     ).fetchone()
     monthly_pnl = float(row["total"])
     denom = _current_bucket_capital_estimate()
