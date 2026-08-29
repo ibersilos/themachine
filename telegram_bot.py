@@ -16,7 +16,7 @@ from typing import Any
 
 import httpx
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes, filters
 from telegram.constants import ParseMode
 
 import config
@@ -875,20 +875,27 @@ def run_bot_in_thread() -> None:
             .token(config.TELEGRAM_BOT_TOKEN)
             .build()
         )
-        app.add_handler(CommandHandler("status",  _cmd_status))
-        app.add_handler(CommandHandler("signals", _cmd_signals))
-        app.add_handler(CommandHandler("risk",    _cmd_risk))
+        # Autorizzazione: solo la chat configurata (TELEGRAM_CHAT_ID) puo'
+        # usare qualsiasi comando — senza questo filtro chiunque scopra lo
+        # username del bot puo' leggere saldo/posizioni o iniettare dati
+        # falsi nel ledger (/open, /close con importi/date arbitrarie).
+        # Trovato da security review, 29/08/2026.
+        _only_owner = filters.Chat(chat_id=int(config.TELEGRAM_CHAT_ID))
+
+        app.add_handler(CommandHandler("status",  _cmd_status, filters=_only_owner))
+        app.add_handler(CommandHandler("signals", _cmd_signals, filters=_only_owner))
+        app.add_handler(CommandHandler("risk",    _cmd_risk, filters=_only_owner))
         # Wheel advisory commands
-        app.add_handler(CommandHandler("wheel",    _cmd_wheel))
-        app.add_handler(CommandHandler("open",     _cmd_open))
-        app.add_handler(CommandHandler("close",    _cmd_close))
-        app.add_handler(CommandHandler("suggest",  _cmd_suggest))
-        app.add_handler(CommandHandler("addpos",   _cmd_addpos))
-        app.add_handler(CommandHandler("income",   _cmd_income))
-        app.add_handler(CommandHandler("capital",  _cmd_capital))
-        app.add_handler(CommandHandler("portfolio",     _cmd_portfolio))
-        app.add_handler(CommandHandler("concentration", _cmd_concentration))
-        app.add_handler(CommandHandler("dividend", _cmd_dividend))
+        app.add_handler(CommandHandler("wheel",    _cmd_wheel, filters=_only_owner))
+        app.add_handler(CommandHandler("open",     _cmd_open, filters=_only_owner))
+        app.add_handler(CommandHandler("close",    _cmd_close, filters=_only_owner))
+        app.add_handler(CommandHandler("suggest",  _cmd_suggest, filters=_only_owner))
+        app.add_handler(CommandHandler("addpos",   _cmd_addpos, filters=_only_owner))
+        app.add_handler(CommandHandler("income",   _cmd_income, filters=_only_owner))
+        app.add_handler(CommandHandler("capital",  _cmd_capital, filters=_only_owner))
+        app.add_handler(CommandHandler("portfolio",     _cmd_portfolio, filters=_only_owner))
+        app.add_handler(CommandHandler("concentration", _cmd_concentration, filters=_only_owner))
+        app.add_handler(CommandHandler("dividend", _cmd_dividend, filters=_only_owner))
 
         logger.info("Telegram bot polling started")
         async with app:

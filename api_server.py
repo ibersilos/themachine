@@ -454,4 +454,8 @@ if __name__ == "__main__":
     # Avvio standalone per sviluppo/test
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    # httpx a INFO logga l'URL completo — se in futuro questo modulo chiama
+    # telegram_bot (token nel path dell'URL), finirebbe in chiaro nei log.
+    # Coerente con main.py/run_once.py (security review 29/08/2026).
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     uvicorn.run(app, host="127.0.0.1", port=8080, reload=False)
