@@ -1,0 +1,326 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#fbfbfb">
+<title>The Machine — Portfolio</title>
+<link rel="manifest" href="/app/manifest.json">
+<link rel="apple-touch-icon" href="/app/apple-touch-icon.png">
+<link rel="icon" href="/app/icon-192.png">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Space+Grotesk:wght@500;700&display=swap">
+<style>
+  :root {
+    --bg: oklch(0.985 0.002 260);
+    --surface: oklch(0.97 0.004 260);
+    --border: oklch(0.9 0.004 260);
+    --fg: oklch(0.2 0.006 260);
+    --muted: oklch(0.5 0.005 260);
+    --muted2: oklch(0.58 0.005 260);
+    --green: oklch(0.45 0.15 150);
+    --green-bg: oklch(0.95 0.03 150);
+    --red: oklch(0.52 0.18 25);
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font-family: 'JetBrains Mono', monospace; }
+  .head-font { font-family: 'Space Grotesk', sans-serif; }
+  a { color: var(--green); }
+  #app { display: flex; flex-direction: column; height: 100dvh; max-width: 480px; margin: 0 auto; overflow: hidden; }
+
+  header { display: flex; align-items: center; justify-content: space-between; padding: max(16px, env(safe-area-inset-top)) 20px 12px; border-bottom: 1px solid var(--border); flex-shrink: 0; }
+  .brand { display: flex; align-items: center; gap: 8px; }
+  .dot { width: 8px; height: 8px; background: var(--green); border-radius: 1px; flex-shrink: 0; }
+  .dot.paused { background: var(--red); }
+  .wordmark { font-size: 15px; font-weight: 700; letter-spacing: 0.02em; }
+  .pill { font-size: 11px; padding: 3px 8px; border: 1px solid oklch(0.5 0.15 150 / 0.35); color: var(--green); }
+  .pill.paused { border-color: oklch(0.52 0.18 25 / 0.35); color: var(--red); }
+
+  main { flex: 1; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+  .view { display: none; padding-bottom: 12px; }
+  .view.active { display: block; }
+
+  .hero { padding: 20px; border-bottom: 1px solid var(--border); }
+  .label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; }
+  .big-num { font-size: 34px; font-weight: 700; margin-top: 2px; }
+  .row-inline { display: flex; gap: 16px; margin-top: 6px; font-size: 12px; color: var(--muted); }
+  .row-inline b { color: var(--fg); font-weight: 600; }
+  .pos { color: var(--green); font-weight: 600; }
+  .neg { color: var(--red); font-weight: 600; }
+
+  .section { padding: 16px 20px 4px; }
+  .section-title { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px; }
+
+  .cycle-row { display: flex; justify-content: space-between; align-items: center; padding: 12px 0; border-bottom: 1px solid var(--surface); }
+  .cycle-row:last-child { border-bottom: none; }
+  .t-name { font-size: 14px; font-weight: 700; }
+  .t-sub { font-size: 11px; color: var(--muted2); margin-top: 2px; }
+  .r-num { font-size: 14px; text-align: right; }
+  .r-label { font-size: 10px; color: var(--muted2); text-align: right; }
+
+  .callout { margin: 16px 20px; padding: 12px 14px; background: var(--green-bg); border-left: 2px solid var(--green); }
+  .callout.warn { background: oklch(0.95 0.04 25); border-left-color: var(--red); }
+  .callout-title { font-size: 11px; color: var(--green); text-transform: uppercase; letter-spacing: 0.06em; font-weight: 600; }
+  .callout.warn .callout-title { color: var(--red); }
+  .callout-sub { font-size: 11px; color: oklch(0.42 0.03 150); margin-top: 3px; }
+
+  .empty { padding: 40px 20px; text-align: center; color: var(--muted); font-size: 13px; }
+
+  nav { display: flex; justify-content: space-between; padding: 12px 20px max(12px, env(safe-area-inset-bottom)); border-top: 1px solid var(--border); flex-shrink: 0; background: var(--bg); }
+  nav button { background: none; border: none; font-family: 'JetBrains Mono', monospace; font-size: 10px; color: var(--muted); padding: 4px; cursor: pointer; }
+  nav button.active { color: var(--fg); font-weight: 700; }
+
+  .log-row { padding: 12px 0; border-bottom: 1px solid var(--surface); }
+  .log-row:last-child { border-bottom: none; }
+  .log-action { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
+  .log-rationale { font-size: 12px; color: var(--muted2); margin-top: 3px; line-height: 1.4; }
+  .log-meta { font-size: 10px; color: var(--muted); margin-top: 4px; }
+
+  .card { background: var(--surface); border-radius: 6px; padding: 14px; margin-bottom: 10px; }
+  .cap-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; padding: 0 20px 16px; }
+  .cap-tile { background: var(--surface); padding: 12px; border-radius: 6px; }
+  .cap-tile .label { margin-bottom: 4px; }
+  .cap-tile .val { font-size: 18px; font-weight: 700; }
+
+  ::-webkit-scrollbar { width: 0; }
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand">
+      <div class="dot" id="statusDot"></div>
+      <div class="wordmark head-font">THE_MACHINE</div>
+    </div>
+    <div class="pill" id="statusPill">…</div>
+  </header>
+
+  <main>
+    <!-- STATO -->
+    <section class="view active" id="view-stato">
+      <div class="hero">
+        <div class="label">bucket_capital_usd</div>
+        <div class="big-num" id="bucketCapital">—</div>
+        <div class="row-inline">
+          <div>MTD <b id="mtdPct" class="pos">—</b></div>
+          <div>CASH <b id="cashVal">—</b></div>
+        </div>
+      </div>
+      <div class="section">
+        <div class="section-title">open_cycles</div>
+      </div>
+      <div id="statoCycles"></div>
+      <div id="killswitchBox"></div>
+    </section>
+
+    <!-- POSIZIONI -->
+    <section class="view" id="view-posizioni">
+      <div class="section"><div class="section-title">posizioni bucket</div></div>
+      <div id="posizioniList" style="padding: 0 20px;"></div>
+    </section>
+
+    <!-- REDDITI -->
+    <section class="view" id="view-redditi">
+      <div class="cap-grid" style="padding-top:16px;" id="incomeGrid"></div>
+      <div class="section"><div class="section-title">cicli chiusi questo mese</div></div>
+      <div id="incomeClosed" style="padding: 0 20px;"></div>
+    </section>
+
+    <!-- LOG -->
+    <section class="view" id="view-log">
+      <div class="section"><div class="section-title">decision_log</div></div>
+      <div id="logList" style="padding: 0 20px;"></div>
+    </section>
+  </main>
+
+  <nav>
+    <button data-view="stato" class="active">STATO</button>
+    <button data-view="posizioni">POSIZIONI</button>
+    <button data-view="redditi">REDDITI</button>
+    <button data-view="log">LOG</button>
+  </nav>
+</div>
+
+<script>
+const API = ""; // stesso origin (/api/...)
+
+function fmtUsd(n) {
+  const v = Number(n || 0);
+  return (v < 0 ? "-$" : "$") + Math.abs(v).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+function fmtPct(n) {
+  const v = Number(n || 0) * 100;
+  return (v >= 0 ? "+" : "") + v.toFixed(2) + "%";
+}
+function daysLeft(expiry) {
+  if (!expiry) return "";
+  const d = Math.ceil((new Date(expiry) - new Date()) / 86400000);
+  return d >= 0 ? d + "g" : "scaduto";
+}
+
+async function getJSON(path) {
+  const r = await fetch(API + path);
+  if (!r.ok) throw new Error(path + " -> " + r.status);
+  return r.json();
+}
+
+async function loadStato() {
+  try {
+    const [status, capital, positions] = await Promise.all([
+      getJSON("/api/status"), getJSON("/api/capital"), getJSON("/api/positions"),
+    ]);
+
+    const dot = document.getElementById("statusDot");
+    const pill = document.getElementById("statusPill");
+    if (status.paused) {
+      dot.classList.add("paused"); pill.classList.add("paused"); pill.textContent = "PAUSED";
+    } else {
+      dot.classList.remove("paused"); pill.classList.remove("paused"); pill.textContent = "ACTIVE";
+    }
+
+    document.getElementById("bucketCapital").textContent =
+      capital.total.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const mtd = document.getElementById("mtdPct");
+    mtd.textContent = fmtPct(status.monthly_pnl_pct);
+    mtd.className = status.monthly_pnl_pct >= 0 ? "pos" : "neg";
+    document.getElementById("cashVal").textContent = fmtUsd(capital.cash);
+
+    const cyclesWrap = document.getElementById("statoCycles");
+    const withCycle = positions.positions.filter((p) => p.cycle);
+    if (withCycle.length === 0) {
+      cyclesWrap.innerHTML = '<div class="empty">Nessun ciclo wheel aperto</div>';
+    } else {
+      cyclesWrap.innerHTML = withCycle.map((p) => {
+        const c = p.cycle;
+        const capUsd = (c.premium_received - c.premium_current) * 100 * (c.phase === "csp" ? -1 : 1);
+        const isPos = capUsd >= 0;
+        return `<div class="cycle-row" style="padding-left:20px;padding-right:20px;">
+          <div>
+            <div class="t-name">${p.ticker} <span style="color:var(--muted);font-weight:400;">${c.phase === "covered_call" ? "CC" : "CSP"} $${c.strike.toFixed(2)}</span></div>
+            <div class="t-sub">exp ${c.expiry} · ${daysLeft(c.expiry)}</div>
+          </div>
+          <div>
+            <div class="r-num ${isPos ? "pos" : "neg"}">${isPos ? "+" : ""}${fmtUsd(capUsd)}</div>
+            <div class="r-label">${c.phase === "covered_call" && capUsd < 0 ? "unrealized" : "captured"}</div>
+          </div>
+        </div>`;
+      }).join("");
+    }
+
+    const kb = document.getElementById("killswitchBox");
+    if (status.paused) {
+      kb.innerHTML = `<div class="callout warn">
+        <div class="callout-title">kill_switch: attivato</div>
+        <div class="callout-sub">in pausa fino a ${status.paused_until || "—"}</div>
+      </div>`;
+    } else {
+      kb.innerHTML = `<div class="callout">
+        <div class="callout-title">kill_switch: armato</div>
+        <div class="callout-sub">drawdown mensile ${fmtPct(status.monthly_pnl_pct)} · soglia -${(status.max_monthly_drawdown*100).toFixed(0)}%</div>
+      </div>`;
+    }
+  } catch (e) {
+    document.getElementById("statoCycles").innerHTML = '<div class="empty">Impossibile caricare i dati — API non raggiungibile</div>';
+  }
+}
+
+async function loadPosizioni() {
+  const wrap = document.getElementById("posizioniList");
+  try {
+    const data = await getJSON("/api/positions");
+    if (data.positions.length === 0) {
+      wrap.innerHTML = '<div class="empty">Nessuna posizione</div>';
+      return;
+    }
+    wrap.innerHTML = data.positions.map((p) => {
+      const c = p.cycle;
+      return `<div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:baseline;">
+          <div class="t-name">${p.ticker}</div>
+          <div class="${p.pnl >= 0 ? "pos" : "neg"}">${fmtUsd(p.pnl)} (${fmtPct(p.pnl_pct/100)})</div>
+        </div>
+        <div class="t-sub">${p.shares} az · entry ${fmtUsd(p.entry_price)} · attuale ${fmtUsd(p.current_price)}</div>
+        ${c ? `<div style="margin-top:8px;padding-top:8px;border-top:1px solid var(--border);font-size:12px;">
+          <div>${c.phase === "covered_call" ? "COVERED CALL" : "CSP"} $${c.strike.toFixed(2)} · scad ${c.expiry} (${daysLeft(c.expiry)})</div>
+          <div style="color:var(--muted2);margin-top:3px;">premio ${fmtUsd(c.premium_received)} → ${fmtUsd(c.premium_current)} · roll ${c.roll_count} · <span style="text-transform:uppercase;">${c.hogue_tag}</span></div>
+        </div>` : ""}
+      </div>`;
+    }).join("");
+  } catch (e) {
+    wrap.innerHTML = '<div class="empty">Impossibile caricare le posizioni</div>';
+  }
+}
+
+async function loadRedditi() {
+  const grid = document.getElementById("incomeGrid");
+  const closedWrap = document.getElementById("incomeClosed");
+  try {
+    const data = await getJSON("/api/income");
+    grid.innerHTML = `
+      <div class="cap-tile"><div class="label">realizzato mese</div><div class="val ${data.total_realized >= 0 ? "pos" : "neg"}">${fmtUsd(data.total_realized)}</div></div>
+      <div class="cap-tile"><div class="label">non realizzato</div><div class="val ${data.total_unrealized >= 0 ? "pos" : "neg"}">${fmtUsd(data.total_unrealized)}</div></div>
+      <div class="cap-tile" style="grid-column:span 2;"><div class="label">realizzato YTD ${data.year}</div><div class="val ${data.ytd_realized >= 0 ? "pos" : "neg"}">${fmtUsd(data.ytd_realized)}</div></div>
+    `;
+    if (data.closed_cycles.length === 0) {
+      closedWrap.innerHTML = '<div class="empty">Nessun ciclo chiuso questo mese</div>';
+    } else {
+      closedWrap.innerHTML = data.closed_cycles.map((c) => `
+        <div class="cycle-row">
+          <div>
+            <div class="t-name">${c.ticker}</div>
+            <div class="t-sub">${(c.closed_at || "").slice(0, 10)}</div>
+          </div>
+          <div class="r-num ${c.pnl_realized >= 0 ? "pos" : "neg"}">${fmtUsd(c.pnl_realized)}</div>
+        </div>`).join("");
+    }
+  } catch (e) {
+    grid.innerHTML = "";
+    closedWrap.innerHTML = '<div class="empty">Impossibile caricare i redditi</div>';
+  }
+}
+
+async function loadLog() {
+  const wrap = document.getElementById("logList");
+  try {
+    const data = await getJSON("/api/decisions?limit=30");
+    if (data.decisions.length === 0) {
+      wrap.innerHTML = '<div class="empty">Nessuna decisione registrata</div>';
+      return;
+    }
+    wrap.innerHTML = data.decisions.map((d) => `
+      <div class="log-row">
+        <div class="log-action">${d.action || ""}${d.ticker ? " · " + d.ticker : ""}</div>
+        <div class="log-rationale">${d.rationale || ""}</div>
+        <div class="log-meta">${d.created_at || ""} · ${d.source || ""}</div>
+      </div>`).join("");
+  } catch (e) {
+    wrap.innerHTML = '<div class="empty">Impossibile caricare il log</div>';
+  }
+}
+
+const loaders = { stato: loadStato, posizioni: loadPosizioni, redditi: loadRedditi, log: loadLog };
+const loaded = new Set();
+
+function showView(name) {
+  document.querySelectorAll(".view").forEach((v) => v.classList.remove("active"));
+  document.getElementById("view-" + name).classList.add("active");
+  document.querySelectorAll("nav button").forEach((b) => b.classList.toggle("active", b.dataset.view === name));
+  if (!loaded.has(name)) { loaded.add(name); loaders[name](); }
+}
+
+document.querySelectorAll("nav button").forEach((b) => {
+  b.addEventListener("click", () => showView(b.dataset.view));
+});
+
+// Ricarica lo Stato ogni 60s se la scheda e' visibile
+setInterval(() => {
+  if (document.visibilityState === "visible") { loaded.delete("stato"); if (document.getElementById("view-stato").classList.contains("active")) loadStato(); }
+}, 60000);
+
+loadStato();
+
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("/app/sw.js").catch(() => {});
+}
+</script>
+</body>
+</html>

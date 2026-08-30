@@ -32,6 +32,8 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 
 import config
 import database as db
@@ -202,13 +204,19 @@ def get_positions() -> dict:
     """
     Posizioni aperte: combina tabella positions + wheel_cycles aperti.
     Include percentuale catturata e stato Hogue (close/roll/hold).
+    Esclude i ticker PAC (config.PAC_EXCLUDE_TICKERS) — non fanno parte del
+    bucket wheel, mostrarli qui confonderebbe il portfolio app col PAC
+    passivo (stesso motivo del fix concentrazione del 29/08).
     """
     try:
         conn = db._conn()
 
-        # Posizioni stock
+        # Posizioni stock — esclude il PAC passivo (VWCE/EXUS)
+        placeholders = ",".join("?" * len(config.PAC_EXCLUDE_TICKERS))
         stock_rows = conn.execute(
-            "SELECT ticker, entry_price, entry_date, shares FROM positions"
+            f"SELECT ticker, entry_price, entry_date, shares FROM positions "
+            f"WHERE ticker NOT IN ({placeholders})",
+            config.PAC_EXCLUDE_TICKERS,
         ).fetchall()
 
         import fundamentals
@@ -353,7 +361,11 @@ def get_wheel(year: int | None = Query(default=None)) -> dict:
 
 @app.get("/api/capital")
 def get_capital() -> dict:
-    """Stato capitale: cash, investito (prezzi live), totale, crescita."""
+    """Stato capitale del bucket wheel: cash, investito (prezzi live), totale.
+    Esclude il PAC (VWCE/EXUS) — stesso motivo di /api/positions. "growth"
+    usa capital.seed com'era in origine (crescita rispetto al capitale
+    iniziale mai aggiornato) — per il P&L mensile reale vedi /api/status,
+    che usa db.get_monthly_realized_pnl_pct() (allowlist corretta 30/08)."""
     try:
         import fundamentals
         cap = db.get_capital()
@@ -365,6 +377,8 @@ def get_capital() -> dict:
         pos_detail = []
         for p in positions:
             ticker = p["ticker"]
+            if ticker in config.PAC_EXCLUDE_TICKERS:
+                continue
             shares = float(p["shares"])
             cost   = float(p["entry_price"])
             price  = fundamentals.current_price(ticker) or cost
@@ -400,6 +414,38 @@ def get_capital() -> dict:
         raise HTTPException(500, str(exc))
 
 
+# ── /api/decisions ───────────────────────────────────────────────────────────
+
+@app.get("/api/decisions")
+def get_decisions(
+    limit: int = Query(default=50, ge=1, le=200),
+    ticker: str | None = Query(default=None),
+) -> dict:
+    """Log decisioni/advisory recenti (decision_log) — schermata Log dell'app."""
+    try:
+        rows = db.get_decision_log(ticker=ticker, limit=limit)
+        return {"ok": True, "count": len(rows), "decisions": _rows_to_list(rows)}
+    except Exception as exc:
+        logger.error("/api/decisions error: %s", exc)
+        raise HTTPException(500, str(exc))
+
+
+# ── /api/income ───────────────────────────────────────────────────────────────
+
+@app.get("/api/income")
+def get_income(
+    year: int | None = Query(default=None),
+    month: int | None = Query(default=None),
+) -> dict:
+    """Report income mese/anno — schermata Redditi dell'app (equivalente /income Telegram)."""
+    try:
+        report = db.get_income_report(year=year, month=month)
+        return {"ok": True, **report}
+    except Exception as exc:
+        logger.error("/api/income error: %s", exc)
+        raise HTTPException(500, str(exc))
+
+
 # ── /api/health ───────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
@@ -425,6 +471,14 @@ def get_ibkr() -> dict:
         "host": config.IBKR_HOST,
         "port": config.IBKR_PORT,
     }
+
+
+# ── Portfolio app (PWA) ──────────────────────────────────────────────────────
+# Servita da /app/ — divisa da dispatcher/driver, resta interamente dentro
+# questo repo (the-machine). html=True serve index.html su /app/ e /app/.
+_WEB_DIR = Path(__file__).parent / "web"
+if _WEB_DIR.exists():
+    app.mount("/app", StaticFiles(directory=str(_WEB_DIR), html=True), name="web")
 
 
 # ── SERVER START ──────────────────────────────────────────────────────────────
