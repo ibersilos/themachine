@@ -31,6 +31,12 @@ DTE_RULE       = 21
 MAX_ROLLS      = 2
 RISK_FREE      = 0.05
 SHARES         = 100
+WHEEL_ANN_RETURN_MIN = config.WHEEL_ANN_RETURN_MIN  # soglia gia' validata, usata anche live
+# Filtro opportunita' di riapertura (idea di Alessandro 31/08/2026, backlog
+# skill) — vedi commento nel loop. Confronto A/B: False = comportamento
+# attuale in produzione, True = chiude al 50% solo se una riapertura fresca
+# renderebbe almeno WHEEL_ANN_RETURN_MIN.
+OPPORTUNITY_FILTER = False
 # Fonte unica: config.WHEEL_COMMISSION_PER_ORDER (era duplicata qui come
 # stima locale mai verificata $0.70, poi corretta a $1.17 ma isolata da
 # wheel_scanner/strategy_advisor/covered_call_optimizer — unificata il
@@ -209,15 +215,41 @@ def main():
             pct = (prem_open - prem_now) / prem_open if prem_open > 0 else 0
 
             if pct >= EARLY_CLOSE:
-                cyc["prem_close"] = round(prem_now, 3)
-                cyc["exit"]       = f"Chiusura anticipata (50%) DTE={dte}"
-                cyc["pnl"]        = (prem_open - prem_now) * SHARES
-                cyc["close_date"] = td_date
-                cash += cyc["pnl"]
-                closed = True
-                cursor_idx = tday_to_pos[td]
-                advanced_inline = True
-                break
+                # Filtro opportunita' di riapertura (idea di Alessandro,
+                # 31/08/2026) — TESTATO E SCARTATO, vedi log skill
+                # the-machine-analyst 31/08/2026. Chiudere al 50% solo se
+                # esiste un ciclo fresco riaprentesi che rende almeno
+                # WHEEL_ANN_RETURN_MIN. Risultato reale su 5 anni: dimezza
+                # il rendimento (+18,4%/anno -> +9,9%/anno) perche' bloccare
+                # la chiusura non significa "aspettare di meglio", significa
+                # togliere l'uscita di sicurezza al 50% — i cicli tenuti
+                # finiscono assegnati ITM in perdita molto piu' spesso
+                # (bucket assegnazioni: +$54,6 -> -$457,3 totali, da solo
+                # spiega tutto il calo). Codice tenuto SOLO per audit trail
+                # del test — OPPORTUNITY_FILTER resta False, MAI attivarlo
+                # in produzione senza nuova evidenza reale.
+                skip_close = False
+                if OPPORTUNITY_FILTER:
+                    reopen_T = TARGET_DTE / 365.0
+                    right = "call" if phase == "cc" else "put"
+                    reopen_K = round_ford_strike(strike_for_delta(S_i, reopen_T, RISK_FREE, vol_i, TARGET_DELTA, right))
+                    reopen_prem = bs_call(S_i, reopen_K, reopen_T, RISK_FREE, vol_i) if right == "call" \
+                        else bs_put(S_i, reopen_K, reopen_T, RISK_FREE, vol_i)
+                    reopen_net = reopen_prem * SHARES - (COMMISSION + SPREAD_COST)  # solo apertura, la chiusura del vecchio e' gia' un costo separato
+                    reopen_ann_ret_net = (reopen_net / SHARES / S_i) * (365 / TARGET_DTE) * 100
+                    if reopen_ann_ret_net < WHEEL_ANN_RETURN_MIN:
+                        skip_close = True
+
+                if not skip_close:
+                    cyc["prem_close"] = round(prem_now, 3)
+                    cyc["exit"]       = f"Chiusura anticipata (50%) DTE={dte}"
+                    cyc["pnl"]        = (prem_open - prem_now) * SHARES
+                    cyc["close_date"] = td_date
+                    cash += cyc["pnl"]
+                    closed = True
+                    cursor_idx = tday_to_pos[td]
+                    advanced_inline = True
+                    break
 
             # Roll CC se stock sale verso strike — controllato PRIMA dello
             # stop meccanico 21-DTE: la difesa via roll deve avere priorita'
