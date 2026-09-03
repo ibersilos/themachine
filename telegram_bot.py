@@ -283,7 +283,11 @@ def dispatch_signal(bd: ScoreBreakdown, signal: dict) -> None:
         logger.info("Bot paused – suppressing alert for %s", bd.ticker)
         return
 
-    if bd.total < config.MIN_ALERT_SCORE:
+    # Solo STRONG BUY su Telegram (deciso 03/09: BUY ALERT/WATCH facevano
+    # troppo rumore per segnali senza edge dimostrato — vedi SRI/ALTO test).
+    # bd.filtered rimane su MIN_ALERT_SCORE (scoring_engine.py) per non perdere
+    # comunque i dati nel backtest interno — qui si taglia solo l'invio Telegram.
+    if bd.total < config.STRONG_BUY_THRESHOLD:
         return
 
     if db.was_recently_alerted(signal.get("source", ""), bd.ticker):
