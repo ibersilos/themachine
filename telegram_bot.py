@@ -887,10 +887,8 @@ async def _cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def _cmd_risk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     conn = db._conn()
     positions = conn.execute("SELECT * FROM positions").fetchall()
-    state = db.get_risk_state()
-
     lines = ["⚖️ *Risk Summary*\n"]
-    lines.append(f"Monthly PnL: `{state['monthly_pnl_pct']*100:+.2f}%`")
+    lines.append(f"Monthly PnL: `{db.get_monthly_realized_pnl_pct()*100:+.2f}%`")
     lines.append(f"Pause status: {'🔴 PAUSED' if db.is_paused() else '🟢 ACTIVE'}\n")
 
     if positions:

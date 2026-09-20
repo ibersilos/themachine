@@ -83,6 +83,25 @@ def _annual_dividend(ticker_obj: yf.Ticker) -> float:
         return 0.0
 
 
+# Tier-1 = pagatori trimestrali: 200gg senza un dividendo = almeno due stacchi saltati.
+_DIV_LAPSE_DAYS = 200
+
+
+def _last_dividend_age_days(ticker_obj: yf.Ticker) -> Optional[int]:
+    """Giorni dall'ultimo dividendo realmente pagato. None se lo storico non e'
+    disponibile (errore o serie vuota): un dato mancante non e' un taglio."""
+    try:
+        divs = ticker_obj.dividends
+        if divs is None or divs.empty:
+            return None
+        last = pd.Timestamp(divs.index[-1])
+        if last.tzinfo is None:
+            last = last.tz_localize("UTC")
+        return (pd.Timestamp.now(tz="UTC") - last).days
+    except Exception:
+        return None
+
+
 _SUGGEST_RISK_FREE = 0.05
 
 
@@ -565,17 +584,23 @@ def _check_thesis_break(positions: list) -> None:
 
             if ticker in config.WHEEL_TIER1_UNIVERSE:
                 t = _get_ticker(ticker)
-                ann_div = _annual_dividend(t)
-                if not ann_div:
-                    send_alert(
-                        f"⚠️ *DIVIDENDO NON RILEVATO — {ticker}*\n"
-                        f"Nessun dividend rate annuo riportato — verifica se è stato "
-                        f"sospeso (titolo Tier-1, scelto apposta per il dividendo)."
-                    )
-                    db.log_decision(
-                        "thesis_break", "Dividend rate annuo non rilevato su titolo Tier-1",
-                        ticker=ticker, source="_check_thesis_break",
-                    )
+                if not _annual_dividend(t):
+                    age = _last_dividend_age_days(t)
+                    if age is None:
+                        logger.warning(
+                            "Thesis-break %s: dividend rate e storico dividendi non disponibili "
+                            "(dato mancante, nessun alert)", ticker,
+                        )
+                    elif age > _DIV_LAPSE_DAYS:
+                        send_alert(
+                            f"⚠️ *DIVIDENDO SOSPESO? — {ticker}*\n"
+                            f"Nessun dividend rate e ultimo dividendo pagato {age} giorni fa — "
+                            f"verifica se è stato sospeso (titolo Tier-1, scelto apposta per il dividendo)."
+                        )
+                        db.log_decision(
+                            "thesis_break", f"Ultimo dividendo {age}gg fa e dividend rate assente su titolo Tier-1",
+                            ticker=ticker, source="_check_thesis_break",
+                        )
         except Exception as exc:
             logger.debug("Thesis-break check %s: %s", ticker, exc)
 

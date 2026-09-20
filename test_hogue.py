@@ -600,6 +600,85 @@ class TestMonthlyRealizedPnl(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  Test: thesis-break su dividendo (dato mancante != taglio)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _divs_paid_days_ago(days: int) -> pd.Series:
+    idx = pd.DatetimeIndex([pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)])
+    return pd.Series([0.15], index=idx)
+
+
+class TestThesisBreakDividend(unittest.TestCase):
+
+    def _run(self, rate, dividends):
+        import wheel_daemon
+        ticker = MagicMock()
+        ticker.info = {"dividendRate": rate}
+        ticker.dividends = dividends
+        with patch.object(wheel_daemon, "_get_ticker", return_value=ticker), \
+             patch("seeking_alpha_feed.get_recent_news", return_value={"sa_div_cut": False}), \
+             patch("telegram_bot.send_alert") as send, \
+             patch.object(wheel_daemon.db, "log_decision") as log:
+            wheel_daemon._check_thesis_break([{"ticker": "F"}])
+        return send, log
+
+    def test_rate_missing_but_recent_dividend_no_alert(self):
+        """Il caso reale del 07 e 10/09: dividendRate assente su yfinance, ma F
+        ha pagato da poco — non e' un taglio."""
+        send, log = self._run(rate=None, dividends=_divs_paid_days_ago(40))
+        send.assert_not_called()
+        log.assert_not_called()
+
+    def test_rate_missing_and_history_empty_no_alert(self):
+        """Storico vuoto = dato non disponibile, non evidenza di sospensione."""
+        send, log = self._run(rate=None, dividends=pd.Series(dtype=float))
+        send.assert_not_called()
+        log.assert_not_called()
+
+    def test_rate_missing_and_dividend_lapsed_alerts(self):
+        send, log = self._run(rate=None, dividends=_divs_paid_days_ago(300))
+        send.assert_called_once()
+        log.assert_called_once()
+
+    def test_rate_present_no_alert(self):
+        send, log = self._run(rate=0.60, dividends=_divs_paid_days_ago(300))
+        send.assert_not_called()
+        log.assert_not_called()
+
+    def test_last_dividend_age_naive_index(self):
+        import wheel_daemon
+        naive = pd.Series([0.1], index=pd.DatetimeIndex([pd.Timestamp.now(tz="UTC").tz_localize(None) - pd.Timedelta(days=10)]))
+        t = MagicMock()
+        t.dividends = naive
+        self.assertIn(wheel_daemon._last_dividend_age_days(t), (9, 10))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Test: /risk deve usare il PnL mensile ricalcolato, non il contatore morto
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestRiskCommand(unittest.TestCase):
+
+    def test_risk_shows_computed_monthly_pnl(self):
+        import asyncio
+        from unittest.mock import AsyncMock
+        import telegram_bot
+
+        conn = MagicMock()
+        conn.execute.return_value.fetchall.return_value = []
+        update = MagicMock()
+        update.message.reply_text = AsyncMock()
+        with patch.object(telegram_bot.db, "_conn", return_value=conn), \
+             patch.object(telegram_bot.db, "get_risk_state", return_value={"monthly_pnl_pct": 0.0}), \
+             patch.object(telegram_bot.db, "get_monthly_realized_pnl_pct", return_value=-0.05), \
+             patch.object(telegram_bot.db, "is_paused", return_value=False):
+            asyncio.run(telegram_bot._cmd_risk(update, None))
+
+        text = update.message.reply_text.call_args.args[0]
+        self.assertIn("-5.00%", text)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Runner diretto
 # ─────────────────────────────────────────────────────────────────────────────
 
