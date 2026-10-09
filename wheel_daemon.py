@@ -287,34 +287,48 @@ def _fmt_suggest(s: dict) -> str:
     )
 
 
-def _fmt_weekly_report(positions: list, year: int, month: int) -> str:
-    report = db.get_income_report(year, month)
-    lines = [
-        f"📅 *WHEEL REPORT — {year}/{month:02d}*\n",
-        f"Cicli chiusi nel mese: `{report['n_closed']}`",
-        f"Premi realizzati:      `${report['total_realized']:.2f}`",
-        f"Premi non realizzati:  `${report['total_unrealized']:.2f}` (posizioni aperte)",
-        f"YTD realizzato:        `${report['ytd_realized']:.2f}`\n",
-    ]
+def _fmt_period(title: str, start: date, end: date) -> list:
+    """Righe di un blocco periodo [start, end) con cicli chiusi e realizzato."""
+    rep = db.get_period_income(start.isoformat(), end.isoformat())
+    lines = [f"*{title}* — cicli chiusi `{rep['n_closed']}`, realizzato `${rep['total_realized']:.2f}`"]
+    for c in rep["closed_cycles"]:
+        lines.append(f"  `{c['ticker']}` `${float(c['pnl_realized'] or 0):.2f}` ({c['closed_at'][:10]})")
+    return lines
 
-    if report["closed_cycles"]:
-        lines.append("*Cicli chiusi:*")
-        for c in report["closed_cycles"]:
-            lines.append(f"  `{c['ticker']}` — `${float(c['pnl_realized']):.2f}` ({c['closed_at'][:10]})")
+
+def _fmt_weekly_report(positions: list, year: int, month: int) -> str:
+    # Il vecchio report usava il solo mese di calendario: nei primi giorni
+    # del mese mostrava "0 cicli, $0" e faceva sparire il mese appena chiuso
+    # (trovato 04/10/2026). Ora: ultimi 7 giorni + mese in corso, e nei primi
+    # 7 giorni del mese anche il mese precedente.
+    today = datetime.utcnow().date()
+    tomorrow = today + timedelta(days=1)
+    month_start = today.replace(day=1)
+    report = db.get_income_report(year, month)
+
+    lines = [f"📅 *WHEEL REPORT — {today.isoformat()}*\n"]
+    lines += _fmt_period("Ultimi 7 giorni", today - timedelta(days=6), tomorrow)
+    lines += _fmt_period(f"Mese {year}/{month:02d}", month_start, tomorrow)
+    if today.day <= 7:
+        prev_end = month_start
+        prev_start = (prev_end - timedelta(days=1)).replace(day=1)
+        lines += _fmt_period(f"Mese {prev_start.year}/{prev_start.month:02d}", prev_start, prev_end)
+    lines.append(f"*YTD realizzato:* `${report['ytd_realized']:.2f}`\n")
 
     if report["open_cycles"]:
-        lines.append("\n*Posizioni aperte:*")
+        lines.append("*Posizioni aperte* (premio da yfinance, approssimato):")
         for c in report["open_cycles"]:
             pnl_open = (float(c["premium_received"]) - float(c["premium_current"])) * 100
             lines.append(
                 f"  `{c['ticker']}` {c['phase'].replace('_', ' ').upper()} — "
-                f"catturato `${pnl_open:.2f}` finora"
+                f"catturato `${pnl_open:.2f}` finora (stima)"
             )
 
     # Dividendi attesi — esclude i ticker PAC (VWCE/EXUS), non fanno parte
     # del bucket wheel e yfinance non li risolve comunque (ticker UCITS,
     # "Quote not found" — trovato in produzione 30/08/2026 insieme al bug
-    # della data ex-div passata).
+    # della data ex-div passata). Importo = annuo/4 per azione: e' un
+    # equivalente TRIMESTRALE anche per i titoli a dividendo mensile (O).
     div_lines = []
     for pos in positions:
         if pos["ticker"] in config.PAC_EXCLUDE_TICKERS:
@@ -326,13 +340,13 @@ def _fmt_weekly_report(positions: list, year: int, month: int) -> str:
             if ann_div > 0:
                 quarterly = ann_div / 4 * float(pos["shares"])
                 div_lines.append(
-                    f"  `{pos['ticker']}` — `${quarterly:.2f}` (ex-div: {ex_div or 'N/D'})"
+                    f"  `{pos['ticker']}` — `${quarterly:.2f}` per trimestre (ex-div: {ex_div or 'N/D'})"
                 )
         except Exception:
             pass
 
     if div_lines:
-        lines.append("\n*Dividendi attesi:*")
+        lines.append("\n*Dividendi attesi (equivalente trimestrale):*")
         lines.extend(div_lines)
 
     return "\n".join(lines)
@@ -766,6 +780,15 @@ def _loop() -> None:
     global _last_check_date, _last_weekly_report
 
     logger.info("wheel_daemon: loop avviato")
+    # Ripristina l'ultimo invio dal DB: lo stato in memoria si azzerava a ogni
+    # riavvio (crash DNS di Telegram + Task Scheduler) e rimandava report/check.
+    try:
+        v = db.get_state("last_check_date")
+        _last_check_date = date.fromisoformat(v) if v else _last_check_date
+        v = db.get_state("last_weekly_report")
+        _last_weekly_report = date.fromisoformat(v) if v else _last_weekly_report
+    except Exception as exc:
+        logger.error("wheel_daemon: ripristino stato fallito: %s", exc)
     while True:
         try:
             now  = datetime.utcnow()
@@ -776,11 +799,13 @@ def _loop() -> None:
             in_window = 7 <= now.hour <= 8  # 9-10 CET
             if in_window and _last_check_date != today:
                 _last_check_date = today
+                db.set_state("last_check_date", today.isoformat())
                 _daily_check()
 
             # Weekly report: domenica mattina
             if today.weekday() == 6 and _last_weekly_report != today:
                 _last_weekly_report = today
+                db.set_state("last_weekly_report", today.isoformat())
                 _weekly_report()
 
         except Exception as exc:

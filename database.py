@@ -159,6 +159,13 @@ def init_db() -> None:
             created_at  TEXT DEFAULT (datetime('now'))
         );
         CREATE INDEX IF NOT EXISTS idx_decision_log_ticker ON decision_log(ticker);
+
+        -- Stato persistente del bot (ultimo invio report/check): lo stato in
+        -- memoria si azzerava a ogni riavvio e rimandava report e check.
+        CREATE TABLE IF NOT EXISTS bot_state (
+            key    TEXT PRIMARY KEY,
+            value  TEXT
+        );
         """)
         # Migrazione: aggiungi colonna pipeline se non esiste (DB pre-dual-pipeline)
         try:
@@ -430,6 +437,36 @@ def get_position(ticker: str):
 
 def get_all_positions() -> list:
     return _conn().execute("SELECT * FROM positions WHERE shares > 0").fetchall()
+
+
+def get_state(key: str) -> str | None:
+    row = _conn().execute("SELECT value FROM bot_state WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def set_state(key: str, value: str) -> None:
+    with tx() as conn:
+        conn.execute(
+            "INSERT INTO bot_state (key, value) VALUES (?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, value),
+        )
+
+
+def get_period_income(start: str, end: str) -> dict:
+    """Cicli chiusi con closed_at in [start, end) (date ISO YYYY-MM-DD)."""
+    rows = _conn().execute(
+        "SELECT ticker, pnl_realized, closed_at FROM wheel_cycles "
+        "WHERE phase='closed' AND date(closed_at) >= ? AND date(closed_at) < ? "
+        "ORDER BY closed_at",
+        (start, end),
+    ).fetchall()
+    cycles = [dict(r) for r in rows]
+    return {
+        "closed_cycles": cycles,
+        "n_closed": len(cycles),
+        "total_realized": sum(float(c["pnl_realized"] or 0) for c in cycles),
+    }
 
 
 def get_income_report(year: int | None = None, month: int | None = None) -> dict:
