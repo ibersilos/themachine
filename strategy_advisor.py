@@ -102,7 +102,7 @@ def compare(ticker: str, source: str, score: int) -> StrategyComparison:
             cmp.trading_period_pct = stats["avg_20d"] * 100  # NON annualizzato di proposito
             cmp.trading_win_rate = stats["win_rate_20d"]
         else:
-            cmp.trading_note = "nessun dato storico ancora per questo bucket — servono altri cicli di backtest_engine"
+            cmp.trading_note = "nessun dato storico ancora per questo bucket — servono altri cicli di backtest"
     except Exception as exc:
         cmp.trading_note = f"errore query backtest: {exc}"
         logger.warning("strategy_advisor trading stats %s/%s: %s", source, score, exc)

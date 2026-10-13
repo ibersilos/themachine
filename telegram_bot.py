@@ -10,6 +10,7 @@ Commands available:
 """
 import json
 import logging
+import re
 import threading
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -247,6 +248,22 @@ def _format_signal_alert(bd: ScoreBreakdown, signal: dict) -> str:
 
 # ── Public send functions ─────────────────────────────────────────────────────
 
+# Un "_" dentro una parola (backtest_engine, snake_case) apre in Markdown legacy
+# un'italics che non si chiude mai: Telegram risponde 400 "can't parse entities"
+# e il messaggio arrivava solo in plain text (trovato 13/10/2026 sull'alert BPRE,
+# per "backtest_engine"). Si escapa solo l'underscore tra caratteri alfanumerici,
+# fuori da code span e dai target dei link, dove un backslash resterebbe visibile.
+_PROTECTED_MD = re.compile(r"(`[^`]*`|\]\([^)]*\))")
+_INTRAWORD_UNDERSCORE = re.compile(r"(?<=[A-Za-z0-9])_(?=[A-Za-z0-9])")
+
+
+def _md_safe(text: str) -> str:
+    parts = _PROTECTED_MD.split(text)
+    for i in range(0, len(parts), 2):
+        parts[i] = _INTRAWORD_UNDERSCORE.sub(r"\_", parts[i])
+    return "".join(parts)
+
+
 def send_alert(text: str) -> None:
     """
     Fire-and-forget alert — httpx sync, funziona da qualsiasi thread/contesto.
@@ -259,12 +276,12 @@ def send_alert(text: str) -> None:
         with httpx.Client(timeout=10) as client:
             resp = client.post(f"{_TG_API}/sendMessage", json={
                 "chat_id": config.TELEGRAM_CHAT_ID,
-                "text": text,
+                "text": _md_safe(text),
                 "parse_mode": "Markdown",
                 "disable_web_page_preview": True,
             })
             if resp.status_code != 200:
-                logger.error("Telegram send failed (%d): %s — ritento in plain text", resp.status_code, resp.text)
+                logger.error("Telegram send failed (%d): %s — ritento in plain text | inizio: %r", resp.status_code, resp.text, text[:80])
                 client.post(f"{_TG_API}/sendMessage", json={
                     "chat_id": config.TELEGRAM_CHAT_ID,
                     "text": text,
@@ -288,6 +305,10 @@ def dispatch_signal(bd: ScoreBreakdown, signal: dict) -> None:
     # bd.filtered rimane su MIN_ALERT_SCORE (scoring_engine.py) per non perdere
     # comunque i dati nel backtest interno — qui si taglia solo l'invio Telegram.
     if bd.total < config.STRONG_BUY_THRESHOLD:
+        return
+
+    if db.filing_already_alerted(signal.get("filing_url") or signal.get("award_url"), signal.get("_db_id")):
+        logger.info("Alert soppresso (stesso documento gia' alertato): %s", bd.ticker)
         return
 
     if db.was_recently_alerted(signal.get("source", ""), bd.ticker):

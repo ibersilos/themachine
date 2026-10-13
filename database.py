@@ -273,6 +273,21 @@ def mark_alerted(signal_id: int) -> None:
         conn.execute("UPDATE signals SET alerted=1 WHERE id=?", (signal_id,))
 
 
+def filing_already_alerted(url: str | None, current_id: int | None = None, days: int = 30) -> bool:
+    """True se lo stesso documento (filing_url/award_url) e' gia' stato alertato.
+    Il feed RSS ripresenta lo stesso Form 4 per giorni e la finestra di 6 ore di
+    was_recently_alerted non basta: lo stesso filing BPRE e' stato alertato 3 volte
+    in 4 giorni (10-13/10/2026)."""
+    if not url:
+        return False
+    row = _conn().execute(
+        "SELECT 1 FROM signals WHERE alerted=1 AND id != ? "
+        "AND created_at >= datetime('now', ?) AND payload LIKE ? LIMIT 1",
+        (current_id or -1, f"-{days} days", f'%"{url}"%'),
+    ).fetchone()
+    return row is not None
+
+
 def was_recently_alerted(source: str, ticker: str | None, hours: int = 6) -> bool:
     """
     True se un segnale della stessa fonte+ticker e' gia' stato alertato
